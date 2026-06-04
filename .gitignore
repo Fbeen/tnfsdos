@@ -1,0 +1,18 @@
+# Build artifacts
+build/*.obj
+build/*.exe
+build/*.map
+
+# DOS debug output
+downloads/
+
+# Private deployment script — copy ftp.sh.example → ftp.sh and fill in details
+ftp.sh
+
+# Editor backups and OS noise
+*.BAK
+*~
+.DS_Store
+
+# Backup copies with bracket-number suffixes (e.g. handler(3).asm)
+*(*)*
