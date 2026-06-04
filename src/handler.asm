@@ -106,6 +106,11 @@ extrn   _log_2f_call        : near   ; void __cdecl (unsigned ax, unsigned bx, u
 extrn   _log_2f_1105        : near   ; void __cdecl (void)  — AX=1105 CHDIR success
 extrn   _do_findfirst       : near   ; unsigned __cdecl (void)
 extrn   _do_findnext        : near   ; unsigned __cdecl (unsigned es, unsigned di)
+extrn   _do_getattr         : near   ; unsigned __cdecl (void) — 0xFFFF=not found, else attr
+extrn   _do_open            : near   ; void __cdecl (unsigned es, unsigned di)
+extrn   _do_spopen          : near   ; void __cdecl (unsigned es, unsigned di) — sets CX=1
+extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx) — buf from SDA->curr_dta
+extrn   _do_close           : near   ; void __cdecl (void)
 
 ;============================================================================
 _TEXT   segment byte public 'CODE'
@@ -773,6 +778,16 @@ new_int2f__ proc far
         ;--- dispatch on AL ---------------------------------------------------
         cmp     al, 05h
         je      handle_1105
+        cmp     al, 06h
+        je      handle_1106
+        cmp     al, 08h
+        je      handle_1108
+        cmp     al, 0Fh
+        je      handle_110F
+        cmp     al, 16h
+        je      handle_1116
+        cmp     al, 2Eh
+        je      handle_112E
         cmp     al, 1Bh
         je      handle_111B
         cmp     al, 1Ch
@@ -874,6 +889,87 @@ do_fn_eof:
         push    bp
         mov     bp, sp
         or      word ptr [bp+6], 0001h
+        pop     bp
+        iret
+
+        ;--- AL=06h: CLOSE — return success ----------------------------------
+handle_1106:
+        call    _do_close
+        mov     word ptr [bp+16], 0
+        jmp     do_2f_ret_ok
+
+        ;--- AL=08h: READ — ES:DI=SFT, CX=bytes, buf from SDA->curr_dta ------
+handle_1108:
+        push    word ptr [bp+12]    ; cx_val   (3rd arg)
+        push    word ptr [bp+6]     ; di_val   (2nd arg)
+        push    word ptr [bp+2]     ; es_val   (1st arg)
+        call    _do_read
+        add     sp, 6
+        mov     word ptr [bp+12], ax    ; CX = bytes read
+        mov     word ptr [bp+16], 0     ; AX = 0
+        jmp     do_2f_ret_ok
+
+        ;--- AL=0Fh: GETATTR — filename in SDA->fn1 --------------------------
+handle_110F:
+        call    _do_getattr
+        cmp     ax, 0FFFFh
+        je      do_110F_nf
+        mov     word ptr [bp+12], ax    ; CX = attribute
+        mov     word ptr [bp+16], 0     ; AX = 0
+        jmp     do_2f_ret_ok
+do_110F_nf:
+        mov     word ptr [bp+16], 2     ; AX = 2 (file not found)
+        jmp     do_2f_ret_err
+
+        ;--- AL=16h: OPEN — ES:DI=SFT ----------------------------------------
+handle_1116:
+        push    word ptr [bp+6]     ; di_val (2nd arg)
+        push    word ptr [bp+2]     ; es_val (1st arg)
+        call    _do_open
+        add     sp, 4
+        mov     word ptr [bp+16], 0
+        jmp     do_2f_ret_ok
+
+        ;--- AL=2Eh: SPOPNFIL (Special Open) — same SFT fill, CX=1 ----------
+        ; Used by TYPE and COPY in MS-DOS 5.0/6.x instead of regular OPEN.
+handle_112E:
+        push    word ptr [bp+6]     ; di_val (2nd arg)
+        push    word ptr [bp+2]     ; es_val (1st arg)
+        call    _do_spopen
+        add     sp, 4
+        mov     word ptr [bp+12], 1     ; CX = 1 (action: file opened)
+        mov     word ptr [bp+16], 0     ; AX = 0
+        jmp     do_2f_ret_ok
+
+        ;--- Shared return paths for the above handlers -----------------------
+do_2f_ret_ok:
+        pop     bp
+        pop     es
+        pop     ds
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        push    bp
+        mov     bp, sp
+        and     word ptr [bp+6], 0FFFEh ; CF = 0
+        pop     bp
+        iret
+do_2f_ret_err:
+        pop     bp
+        pop     es
+        pop     ds
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        push    bp
+        mov     bp, sp
+        or      word ptr [bp+6], 0001h  ; CF = 1
         pop     bp
         iret
 

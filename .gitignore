@@ -6,8 +6,11 @@ build/*.map
 # DOS debug output
 downloads/
 
-# Private deployment script — copy ftp.sh.example → ftp.sh and fill in details
-ftp.sh
+# Private deployment scripts (contain credentials)
+ftp*
+
+# Claude Code project settings
+.claude/
 
 # Editor backups and OS noise
 *.BAK

@@ -906,6 +906,7 @@ static unsigned int calc_resident_paras(void)
  */
 #define DRIVE_T_IDX     19      /* T: = A(0)+19, 0-based               */
 #define CDS_ENTRY_SIZE  88      /* DOS 4–6: 88 bytes per CDS entry      */
+#define README_SIZE     21      /* sizeof("Hello from TNFSDRV!\r\n") - 1 */
 
 #define CDS_FLAG_REMOTE 0x8000u
 
@@ -1037,8 +1038,8 @@ unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
     found[0]='R'; found[1]='E'; found[2]='A'; found[3]='D'; found[4]='M'; found[5]='E';
     found[6]=' '; found[7]=' ';
     found[8]='T'; found[9]='X'; found[10]='T';
-    found[11] = 0x20;   /* archive */
-    found[28] = 123;    /* fsize low byte = 123; bytes 29..31 already 0 */
+    found[11] = 0x20;               /* archive */
+    found[28] = (char)README_SIZE;  /* fsize low byte; 29..31 already 0 */
 
     /* Advance state: dir_entry = 2 (next FINDNEXT → EOF) */
     dta[13] = 2; dta[14] = 0;
@@ -1047,6 +1048,169 @@ unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
     for (k = 0; k < 32; k++) dta[0x15+k] = found[k];
 
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  INT 2Fh file I/O handlers: GETATTR / OPEN / READ / CLOSE           */
+/* ------------------------------------------------------------------ */
+
+/* Content served by T:\README.TXT (README_SIZE defined near top of section) */
+static const char readme_content[] = "Hello from TNFSDRV!\r\n";
+
+/*
+ * last_component_is: return 1 if the last backslash-separated component of
+ * SDA->fn1 (at glob_sdaptr+0x9E) equals `name` (case-insensitive).
+ */
+static int last_component_is(const char *name)
+{
+    char far *fn1 = glob_sdaptr + 0x9E;
+    char far *comp;
+    int i;
+    char pc, nc;
+
+    comp = fn1;
+    for (i = 0; fn1[i]; i++)
+        if (fn1[i] == '\\') comp = fn1 + i + 1;
+
+    for (i = 0; name[i]; i++) {
+        pc = comp[i]; nc = name[i];
+        if (!pc) return 0;
+        if (pc >= 'a' && pc <= 'z') pc -= 32;
+        if (nc >= 'a' && nc <= 'z') nc -= 32;
+        if (pc != nc) return 0;
+    }
+    return (comp[i] == '\0');
+}
+
+/*
+ * do_getattr: INT 2Fh AX=110Fh GET FILE ATTRIBUTES.
+ * Filename is in SDA->fn1 (glob_sdaptr+0x9E).
+ * Returns attribute byte on success, 0xFFFF if not found.
+ * Caller (ASM) sets CX=retval, AX=0, CF=0 on success;
+ *              sets AX=2, CF=1 on 0xFFFF.
+ */
+unsigned int __cdecl do_getattr(void)
+{
+    if (!glob_sdaptr) return 0xFFFF;
+    if (rbuf.enabled) {
+        rb_write("2F 110F \"");
+        rb_far_str(FP_SEG(glob_sdaptr + 0x9E), FP_OFF(glob_sdaptr + 0x9E), 32);
+        rb_write("\"\r\n");
+    }
+    if (last_component_is("README.TXT")) return 0x20;  /* archive */
+    if (last_component_is("GAMES"))     return 0x10;   /* directory */
+    return 0xFFFF;
+}
+
+/*
+ * fill_sft_readme: shared SFT fill for OPEN (AL=16h) and SPOPNFIL (AL=2Eh).
+ *
+ * SFT layout (DOSSTRUC.H sftstruct):
+ *   +00  handle_count (word)   — set by DOS, leave
+ *   +02  open_mode    (word)   — set by DOS, leave
+ *   +04  file_attr    (byte)
+ *   +05  dev_info_word(word)   — bit 15 = network
+ *   +07  dev_drvr_ptr (4 bytes)— NULL for network
+ *   +0B  start_sector (word)
+ *   +0D  file_time    (dword)
+ *   +11  file_size    (dword)
+ *   +15  file_pos     (dword)
+ *   +19..+1F other fields
+ *   +20  file_name[11] (FCB format)
+ */
+static void fill_sft_readme(char far *sft)
+{
+    sft[0x04] = 0x20;               /* file_attr: archive */
+    sft[0x05] = (char)DRIVE_T_IDX; /* dev_info_word low: drive number */
+    sft[0x06] = 0x80;               /* dev_info_word high: bit 15 = network */
+    sft[0x07] = sft[0x08] = sft[0x09] = sft[0x0A] = 0; /* dev_drvr_ptr: NULL */
+    sft[0x0B] = sft[0x0C] = 0;     /* start_sector */
+    sft[0x0D] = sft[0x0E] = sft[0x0F] = sft[0x10] = 0; /* file_time */
+    sft[0x11] = README_SIZE;        /* file_size low byte */
+    sft[0x12] = sft[0x13] = sft[0x14] = 0;
+    sft[0x15] = sft[0x16] = sft[0x17] = sft[0x18] = 0; /* file_pos: 0 */
+    sft[0x19] = sft[0x1A] = sft[0x1B] = sft[0x1C] = 0;
+    sft[0x1D] = sft[0x1E] = sft[0x1F] = 0;
+    sft[0x20]='R'; sft[0x21]='E'; sft[0x22]='A'; sft[0x23]='D';
+    sft[0x24]='M'; sft[0x25]='E'; sft[0x26]=' '; sft[0x27]=' ';
+    sft[0x28]='T'; sft[0x29]='X'; sft[0x2A]='T';
+}
+
+/* do_open: INT 2Fh AX=1116h OPEN */
+void __cdecl do_open(unsigned int es_val, unsigned int di_val)
+{
+    if (rbuf.enabled) rb_write("2F 1116 OPEN\r\n");
+    fill_sft_readme((char far *)MK_FP(es_val, di_val));
+}
+
+/*
+ * do_spopen: INT 2Fh AX=112Eh SPOPNFIL (Special Open).
+ * Used by TYPE and COPY in MS-DOS 5.0/6.x instead of regular OPEN.
+ * Same SFT fill as OPEN; caller (ASM) sets CX=1 (action: file opened).
+ */
+void __cdecl do_spopen(unsigned int es_val, unsigned int di_val)
+{
+    if (rbuf.enabled) rb_write("2F 112E SPOP\r\n");
+    fill_sft_readme((char far *)MK_FP(es_val, di_val));
+}
+
+/*
+ * do_read: INT 2Fh AX=1108h READ.
+ * ES:DI → SFT; CX = bytes requested.
+ * Buffer is SDA->curr_dta (EtherDFS pattern — NOT DS:DX).
+ * Reads from readme_content at current file_pos, updates SFT->file_pos.
+ * Returns bytes actually read (placed in CX by caller; AX=0, CF=0).
+ */
+unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
+                              unsigned int cx_val)
+{
+    char far *sft = (char far *)MK_FP(es_val, di_val);
+    char far *sda = glob_sdaptr;
+    char far *buf;
+    unsigned int dta_off, dta_seg;
+    unsigned long pos;
+    unsigned int avail, count, i;
+
+    /* Read buffer = SDA->curr_dta (far ptr at SDA+0x0C) */
+    dta_off = (unsigned int)(unsigned char)sda[0x0C]
+            | ((unsigned int)(unsigned char)sda[0x0D] << 8);
+    dta_seg = (unsigned int)(unsigned char)sda[0x0E]
+            | ((unsigned int)(unsigned char)sda[0x0F] << 8);
+    buf = (char far *)MK_FP(dta_seg, dta_off);
+
+    /* Read file_pos from SFT+0x15 (dword, little-endian) */
+    pos = (unsigned long)(unsigned char)sft[0x15]
+        | ((unsigned long)(unsigned char)sft[0x16] << 8)
+        | ((unsigned long)(unsigned char)sft[0x17] << 16)
+        | ((unsigned long)(unsigned char)sft[0x18] << 24);
+
+    if (pos >= README_SIZE) {
+        if (rbuf.enabled) rb_write("2F 1108 EOF\r\n");
+        return 0;
+    }
+    avail = README_SIZE - (unsigned int)pos;
+    count = (cx_val < avail) ? cx_val : avail;
+
+    for (i = 0; i < count; i++) buf[i] = readme_content[(unsigned int)pos + i];
+
+    pos += count;
+    sft[0x15] = (char)pos;
+    sft[0x16] = (char)(pos >> 8);
+    sft[0x17] = (char)(pos >> 16);
+    sft[0x18] = (char)(pos >> 24);
+
+    if (rbuf.enabled) {
+        rb_write("2F 1108 READ cnt="); rb_hex16(count);
+        rb_write(" DTA="); rb_hex16(dta_seg); rb_putc(':'); rb_hex16(dta_off);
+        rb_write("\r\n");
+    }
+    return count;
+}
+
+/* do_close: INT 2Fh AX=1106h CLOSE — always return success. */
+void __cdecl do_close(void)
+{
+    if (rbuf.enabled) rb_write("2F 1106 CLOSE\r\n");
 }
 
 /* INT 21h AH=52h: return ES:BX as a far pointer. */
