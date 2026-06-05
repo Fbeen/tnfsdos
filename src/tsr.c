@@ -7,11 +7,18 @@
  *        AL=05h  CHDIR      — validate path; accept T:\ and T:\GAMES
  *        AL=06h  CLOSE      — always succeed
  *        AL=08h  READ       — serve fake README.TXT content
+ *        AL=0Ch  DISKSPACE  — return fake 16 MB volume info
  *        AL=0Fh  GETATTR    — return attributes from SDA->fn1
  *        AL=16h  OPEN       — fill SFT for README.TXT
  *        AL=2Eh  SPOPNFIL   — same as OPEN (used by TYPE/COPY in DOS 5+/6.x)
- *        AL=1Bh  FINDFIRST  — fn1+template-based dispatch
- *        AL=1Ch  FINDNEXT   — DTA dir_entry sequence
+ *        AL=1Bh  FINDFIRST  — enumerates root_entries[] via FsEntry layer
+ *        AL=1Ch  FINDNEXT   — continues enumeration by dir_entry index
+ *
+ * Filesystem abstraction:
+ *   FsEntry / root_entries[]  —  static table describing T:\ contents.
+ *   Handlers never hardcode file names; all dispatch goes through
+ *   fs_find_root(), fs_get_root_entry(), fs_find_by_tmpl() etc.
+ *   Replace root_entries[] with a TNFS readdir result to add network FS.
  *
  * Compile: wcc -bt=dos -ms -3 -d2 -s -zu tsr.c
  * See README.md for full build and test instructions.
@@ -171,6 +178,25 @@ static unsigned int calc_resident_paras(void)
 #define DRIVE_T_IDX     19      /* T: = A(0)+19, 0-based               */
 #define CDS_ENTRY_SIZE  88      /* DOS 4–6: 88 bytes per CDS entry      */
 #define README_SIZE     21      /* sizeof("Hello from TNFSDRV!\r\n") - 1 */
+#define VOLUME_LABEL    "TNFSDOS    "  /* 11 bytes, FCB-padded; change as needed */
+
+/* ------------------------------------------------------------------ */
+/*  Filesystem table  (replace with TNFS readdir later)                */
+/* ------------------------------------------------------------------ */
+
+static const char readme_content[] = "Hello from TNFSDRV!\r\n";
+
+typedef struct {
+    const char    *name;
+    unsigned char  attr;
+    unsigned long  size;
+    const char    *content;   /* NULL for directories */
+} FsEntry;
+
+static FsEntry root_entries[] = {
+    { "GAMES",      0x10, 0,           NULL           },
+    { "README.TXT", 0x20, README_SIZE, readme_content }
+};
 
 #define CDS_FLAG_REMOTE 0x8000u
 
@@ -223,6 +249,119 @@ static int fn1_eq(char far *fn1, const char *s)
     return (fn1[i] == '\0' || (fn1[i] == '\\' && fn1[i+1] == '\0'));
 }
 
+static int last_component_is(const char *name); /* forward decl — defined below */
+
+/* ------------------------------------------------------------------ */
+/*  Filesystem helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+static int str_eq_ci(const char *a, const char *b)
+{
+    int i;
+    for (i = 0; ; i++) {
+        char ac = a[i], bc = b[i];
+        if (ac >= 'a' && ac <= 'z') ac -= 32;
+        if (bc >= 'a' && bc <= 'z') bc -= 32;
+        if (ac != bc) return 0;
+        if (!ac) return 1;
+    }
+}
+
+static int fs_get_root_count(void)
+{
+    return (int)(sizeof(root_entries) / sizeof(root_entries[0]));
+}
+
+static FsEntry *fs_get_root_entry(int idx) { return &root_entries[idx]; }
+
+static FsEntry *fs_find_root(const char *name)
+{
+    int i;
+    for (i = 0; i < fs_get_root_count(); i++)
+        if (str_eq_ci(root_entries[i].name, name)) return &root_entries[i];
+    return NULL;
+}
+
+/* Convert "README.TXT" → "README  TXT" (11-byte FCB format, near buffers). */
+static void entry_to_fcb(const char *name, char fcb[11])
+{
+    int i, dot = -1;
+    for (i = 0; i < 11; i++) fcb[i] = ' ';
+    for (i = 0; name[i]; i++) { if (name[i] == '.') { dot = i; break; } }
+    if (dot < 0) {
+        for (i = 0; name[i] && i < 8; i++) fcb[i] = name[i];
+    } else {
+        for (i = 0; i < dot && i < 8; i++) fcb[i] = name[i];
+        for (i = 0; name[dot+1+i] && i < 3; i++) fcb[8+i] = name[dot+1+i];
+    }
+}
+
+/* Fill 32-byte found_file (SDA+0x1B3) from an FsEntry. */
+static void fill_found_from_entry(FsEntry *e, char far *found)
+{
+    static char fcb[11];   /* static: DS-relative, avoids -zu SS≠DS warning */
+    int k;
+    entry_to_fcb(e->name, fcb);
+    for (k = 0; k < 11; k++) found[k] = fcb[k];
+    found[11] = e->attr;
+    found[28] = (char)(e->size         & 0xFFUL);
+    found[29] = (char)((e->size >>  8) & 0xFFUL);
+    found[30] = (char)((e->size >> 16) & 0xFFUL);
+    found[31] = (char)((e->size >> 24) & 0xFFUL);
+}
+
+/* Fill an SFT from root_entries[idx].
+ * Stores idx in sft[0x0B] (start_sector) as private tag for do_read. */
+static void fill_sft_entry(int idx, char far *sft)
+{
+    FsEntry *e = &root_entries[idx];
+    static char fcb[11];
+    int k;
+    entry_to_fcb(e->name, fcb);
+    sft[0x04] = e->attr;
+    sft[0x05] = (char)DRIVE_T_IDX;
+    sft[0x06] = 0x80;
+    sft[0x07] = sft[0x08] = sft[0x09] = sft[0x0A] = 0;
+    sft[0x0B] = (char)idx;   /* private: entry index, read back by do_read */
+    sft[0x0C] = 0;
+    sft[0x0D] = sft[0x0E] = sft[0x0F] = sft[0x10] = 0;
+    sft[0x11] = (char)(e->size         & 0xFFUL);
+    sft[0x12] = (char)((e->size >>  8) & 0xFFUL);
+    sft[0x13] = (char)((e->size >> 16) & 0xFFUL);
+    sft[0x14] = (char)((e->size >> 24) & 0xFFUL);
+    sft[0x15] = sft[0x16] = sft[0x17] = sft[0x18] = 0;
+    sft[0x19] = sft[0x1A] = sft[0x1B] = sft[0x1C] = 0;
+    sft[0x1D] = sft[0x1E] = sft[0x1F] = 0;
+    for (k = 0; k < 11; k++) sft[0x20+k] = fcb[k];
+}
+
+/* Return index of root entry whose FCB name matches tmpl, -1 if none. */
+static int fs_find_by_tmpl(char far *tmpl)
+{
+    int i;
+    static char fcb[11];
+    for (i = 0; i < fs_get_root_count(); i++) {
+        entry_to_fcb(root_entries[i].name, fcb);
+        if (tmpl_matches(tmpl, fcb)) return i;
+    }
+    return -1;
+}
+
+/* If fn1 = "T:\<name>\..." and <name> is a known root entry, return that entry.
+ * Returns NULL for root-level paths or unknown component. */
+static FsEntry *fn1_subdir_entry(char far *fn1)
+{
+    static char name[13];
+    char far *p;
+    int i;
+    if (!fn1_has_prefix(fn1, "T:\\")) return NULL;
+    p = fn1 + 3;
+    for (i = 0; i < 12 && p[i] && p[i] != '\\'; i++) name[i] = (char)p[i];
+    if (p[i] != '\\') return NULL;
+    name[i] = '\0';
+    return fs_find_root(name);
+}
+
 /*
  * do_chdir: INT 2Fh AX=1105h CHDIR.
  * Validates the target path from SDA->fn1.  DOS updates the CDS itself on
@@ -232,6 +371,7 @@ static int fn1_eq(char far *fn1, const char *s)
 unsigned int __cdecl do_chdir(void)
 {
     char far *fn1;
+    int i;
     if (!glob_sdaptr) return 3;
     fn1 = glob_sdaptr + 0x9E;
 
@@ -239,15 +379,16 @@ unsigned int __cdecl do_chdir(void)
         if (rbuf.enabled) rb_write("2F 1105 CHDIR OK ROOT\r\n");
         return 0;
     }
-    if (fn1_eq(fn1, "T:\\GAMES")) {
-        if (rbuf.enabled) rb_write("2F 1105 CHDIR OK GAMES\r\n");
-        return 0;
+    if (fn1_has_prefix(fn1, "T:\\")) {
+        for (i = 0; i < fs_get_root_count(); i++) {
+            FsEntry *e = fs_get_root_entry(i);
+            if ((e->attr & 0x10) && last_component_is(e->name)) {
+                if (rbuf.enabled) { rb_write("2F 1105 CHDIR OK "); rb_write(e->name); rb_write("\r\n"); }
+                return 0;
+            }
+        }
     }
-    if (fn1_has_prefix(fn1, "T:\\README.TXT")) {
-        if (rbuf.enabled) rb_write("2F 1105 CHDIR FAIL FILE\r\n");
-        return 3;
-    }
-    if (rbuf.enabled) rb_write("2F 1105 CHDIR FAIL UNKNOWN\r\n");
+    if (rbuf.enabled) rb_write("2F 1105 CHDIR FAIL\r\n");
     return 3;
 }
 
@@ -282,12 +423,13 @@ unsigned int __cdecl do_findfirst(void)
     unsigned char srch_attr;
     unsigned int dta_off, dta_seg;
     unsigned char dir_entry_next;
-    int k;
+    FsEntry *sub;   /* result of fn1_subdir_entry — not passed by address */
+    int idx, k;
 
     if (!sda) { if (rbuf.enabled) rb_write("2F 111B NO SDA\r\n"); return 0x12; }
 
-    fn1       = sda + 0x9E;    /* full canonical search path */
-    tmpl      = sda + 0x22B;   /* FCB template (11 bytes) */
+    fn1       = sda + 0x9E;
+    tmpl      = sda + 0x22B;
     srch_attr = (unsigned char)sda[0x24D];
 
     if (rbuf.enabled) {
@@ -297,64 +439,40 @@ unsigned int __cdecl do_findfirst(void)
         rb_write("\r\n");
     }
 
-    /* Volume-label search: not found */
-    if (srch_attr & 0x08u) {
-        if (rbuf.enabled) rb_write("2F 111B VOLABEL\r\n");
-        return 0x12;
-    }
-
-    /* --- path-context classification using fn1 --- */
-
-    /* T:\README.TXT\... : file treated as directory → path not found */
-    if (fn1_has_prefix(fn1, "T:\\README.TXT\\")) {
-        if (rbuf.enabled) rb_write("2F 111B INVALID\r\n");
-        return 3;
-    }
-
-    /* T:\GAMES\... : directory exists but is empty */
-    if (fn1_has_prefix(fn1, "T:\\GAMES\\")) {
-        if (rbuf.enabled) rb_write("2F 111B GAMES_DIR EMPTY\r\n");
-        return 0x12;
-    }
-
-    /* T:\ root context: classify by template */
-    if (!fn1_has_prefix(fn1, "T:\\")) {
-        if (rbuf.enabled) rb_write("2F 111B UNKNOWN PATH\r\n");
-        return 0x12;
-    }
-
     found = sda + 0x1B3;
     for (k = 0; k < 32; k++) found[k] = 0;
 
-    if (is_wildcard_template(tmpl)) {
-        /* T:\*.* — root listing; GAMES first, FINDNEXT gives README */
-        if (rbuf.enabled) rb_write("2F 111B FF ROOT GAMES\r\n");
-        found[0]='G'; found[1]='A'; found[2]='M'; found[3]='E'; found[4]='S';
-        found[5]=' '; found[6]=' '; found[7]=' ';
-        found[8]=' '; found[9]=' '; found[10]=' ';
-        found[11] = 0x10;
-        dir_entry_next = 1;
-    } else if (tmpl_matches(tmpl, "README  TXT")) {
-        if (rbuf.enabled) rb_write("2F 111B FF README\r\n");
-        found[0]='R'; found[1]='E'; found[2]='A'; found[3]='D'; found[4]='M'; found[5]='E';
-        found[6]=' '; found[7]=' ';
-        found[8]='T'; found[9]='X'; found[10]='T';
-        found[11] = 0x20;
-        found[28] = (char)README_SIZE;
-        dir_entry_next = 2;
-    } else if (tmpl_matches(tmpl, "GAMES      ")) {
-        if (rbuf.enabled) rb_write("2F 111B FF GAMES\r\n");
-        found[0]='G'; found[1]='A'; found[2]='M'; found[3]='E'; found[4]='S';
-        found[5]=' '; found[6]=' '; found[7]=' ';
-        found[8]=' '; found[9]=' '; found[10]=' ';
-        found[11] = 0x10;
-        dir_entry_next = 2;
-    } else {
-        if (rbuf.enabled) rb_write("2F 111B NOMATCH\r\n");
+    if (srch_attr & 0x08u) {
+        const char *lbl = VOLUME_LABEL;
+        if (rbuf.enabled) rb_write("2F 111B VOLABEL OK\r\n");
+        for (k = 0; k < 11; k++) found[k] = lbl[k];
+        found[11] = 0x08;
+        dir_entry_next = (unsigned char)fs_get_root_count();
+    } else if ((sub = fn1_subdir_entry(fn1)) != NULL) {
+        if (sub->attr & 0x10) {
+            if (rbuf.enabled) rb_write("2F 111B SUBDIR EMPTY\r\n");
+            return 0x12;
+        }
+        if (rbuf.enabled) rb_write("2F 111B INVALID\r\n");
+        return 3;
+    } else if (!fn1_has_prefix(fn1, "T:\\")) {
+        if (rbuf.enabled) rb_write("2F 111B UNKNOWN PATH\r\n");
         return 0x12;
+    } else if (is_wildcard_template(tmpl)) {
+        if (rbuf.enabled) rb_write("2F 111B FF ROOT FIRST\r\n");
+        fill_found_from_entry(fs_get_root_entry(0), found);
+        dir_entry_next = 1;
+    } else {
+        idx = fs_find_by_tmpl(tmpl);
+        if (idx < 0) {
+            if (rbuf.enabled) rb_write("2F 111B NOMATCH\r\n");
+            return 0x12;
+        }
+        if (rbuf.enabled) { rb_write("2F 111B FF "); rb_write(root_entries[idx].name); rb_write("\r\n"); }
+        fill_found_from_entry(fs_get_root_entry(idx), found);
+        dir_entry_next = (unsigned char)fs_get_root_count();
     }
 
-    /* Init DTA/SDB and copy found_file */
     dta_off = (unsigned int)(unsigned char)sda[0x0C]
             | ((unsigned int)(unsigned char)sda[0x0D] << 8);
     dta_seg = (unsigned int)(unsigned char)sda[0x0E]
@@ -394,28 +512,21 @@ unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
 {
     char far *dta   = (char far *)MK_FP(es_val, di_val);
     char far *found = glob_sdaptr + 0x1B3;
+    int idx = (unsigned char)dta[13];
     int k;
 
-    /* dir_entry from DTA/SDB+13 */
-    if ((unsigned char)dta[13] >= 2) {
+    if (idx >= fs_get_root_count()) {
         if (rbuf.enabled) rb_write("2F 111C EOF\r\n");
         return 0x12;
     }
 
-    if (rbuf.enabled) rb_write("2F 111C FINDNEXT README\r\n");
+    if (rbuf.enabled) { rb_write("2F 111C FINDNEXT "); rb_write(root_entries[idx].name); rb_write("\r\n"); }
 
-    /* Fill SDA found_file with README.TXT */
     for (k = 0; k < 32; k++) found[k] = 0;
-    found[0]='R'; found[1]='E'; found[2]='A'; found[3]='D'; found[4]='M'; found[5]='E';
-    found[6]=' '; found[7]=' ';
-    found[8]='T'; found[9]='X'; found[10]='T';
-    found[11] = 0x20;               /* archive */
-    found[28] = (char)README_SIZE;  /* fsize low byte; 29..31 already 0 */
+    fill_found_from_entry(&root_entries[idx], found);
 
-    /* Advance state: dir_entry = 2 (next FINDNEXT → EOF) */
-    dta[13] = 2; dta[14] = 0;
+    dta[13] = (char)(idx + 1); dta[14] = 0;
 
-    /* Copy found_file to DTA+0x15 */
     for (k = 0; k < 32; k++) dta[0x15+k] = found[k];
 
     return 0;
@@ -424,9 +535,6 @@ unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
 /* ------------------------------------------------------------------ */
 /*  INT 2Fh file I/O handlers: GETATTR / OPEN / READ / CLOSE           */
 /* ------------------------------------------------------------------ */
-
-/* Content served by T:\README.TXT (README_SIZE defined near top of section) */
-static const char readme_content[] = "Hello from TNFSDRV!\r\n";
 
 /*
  * last_component_is: return 1 if the last backslash-separated component of
@@ -462,68 +570,38 @@ static int last_component_is(const char *name)
  */
 unsigned int __cdecl do_getattr(void)
 {
+    int i;
     if (!glob_sdaptr) return 0xFFFF;
     if (rbuf.enabled) {
         rb_write("2F 110F \"");
         rb_far_str(FP_SEG(glob_sdaptr + 0x9E), FP_OFF(glob_sdaptr + 0x9E), 32);
         rb_write("\"\r\n");
     }
-    if (last_component_is("README.TXT")) return 0x20;  /* archive */
-    if (last_component_is("GAMES"))     return 0x10;   /* directory */
+    for (i = 0; i < fs_get_root_count(); i++)
+        if (last_component_is(root_entries[i].name)) return root_entries[i].attr;
     return 0xFFFF;
-}
-
-/*
- * fill_sft_readme: shared SFT fill for OPEN (AL=16h) and SPOPNFIL (AL=2Eh).
- *
- * SFT layout (DOSSTRUC.H sftstruct):
- *   +00  handle_count (word)   — set by DOS, leave
- *   +02  open_mode    (word)   — set by DOS, leave
- *   +04  file_attr    (byte)
- *   +05  dev_info_word(word)   — bit 15 = network
- *   +07  dev_drvr_ptr (4 bytes)— NULL for network
- *   +0B  start_sector (word)
- *   +0D  file_time    (dword)
- *   +11  file_size    (dword)
- *   +15  file_pos     (dword)
- *   +19..+1F other fields
- *   +20  file_name[11] (FCB format)
- */
-static void fill_sft_readme(char far *sft)
-{
-    sft[0x04] = 0x20;               /* file_attr: archive */
-    sft[0x05] = (char)DRIVE_T_IDX; /* dev_info_word low: drive number */
-    sft[0x06] = 0x80;               /* dev_info_word high: bit 15 = network */
-    sft[0x07] = sft[0x08] = sft[0x09] = sft[0x0A] = 0; /* dev_drvr_ptr: NULL */
-    sft[0x0B] = sft[0x0C] = 0;     /* start_sector */
-    sft[0x0D] = sft[0x0E] = sft[0x0F] = sft[0x10] = 0; /* file_time */
-    sft[0x11] = README_SIZE;        /* file_size low byte */
-    sft[0x12] = sft[0x13] = sft[0x14] = 0;
-    sft[0x15] = sft[0x16] = sft[0x17] = sft[0x18] = 0; /* file_pos: 0 */
-    sft[0x19] = sft[0x1A] = sft[0x1B] = sft[0x1C] = 0;
-    sft[0x1D] = sft[0x1E] = sft[0x1F] = 0;
-    sft[0x20]='R'; sft[0x21]='E'; sft[0x22]='A'; sft[0x23]='D';
-    sft[0x24]='M'; sft[0x25]='E'; sft[0x26]=' '; sft[0x27]=' ';
-    sft[0x28]='T'; sft[0x29]='X'; sft[0x2A]='T';
 }
 
 /*
  * do_open: INT 2Fh AX=1116h OPEN.
  * Returns 0 on success, 5 (access denied) for directories, 2 (not found) otherwise.
+ * SFT layout is filled by fill_sft_entry(); see its comment for field details.
  */
 unsigned int __cdecl do_open(unsigned int es_val, unsigned int di_val)
 {
-    if (last_component_is("GAMES")) {
-        if (rbuf.enabled) rb_write("2F 1116 OPEN GAMES DENIED\r\n");
-        return 5;   /* access denied: can't open a directory as a file */
+    int i;
+    for (i = 0; i < fs_get_root_count(); i++) {
+        if (!last_component_is(root_entries[i].name)) continue;
+        if (root_entries[i].attr & 0x10) {
+            if (rbuf.enabled) rb_write("2F 1116 OPEN DENIED\r\n");
+            return 5;
+        }
+        if (rbuf.enabled) rb_write("2F 1116 OPEN OK\r\n");
+        fill_sft_entry(i, (char far *)MK_FP(es_val, di_val));
+        return 0;
     }
-    if (!last_component_is("README.TXT")) {
-        if (rbuf.enabled) rb_write("2F 1116 OPEN NOTFOUND\r\n");
-        return 2;
-    }
-    if (rbuf.enabled) rb_write("2F 1116 OPEN README\r\n");
-    fill_sft_readme((char far *)MK_FP(es_val, di_val));
-    return 0;
+    if (rbuf.enabled) rb_write("2F 1116 OPEN NOTFOUND\r\n");
+    return 2;
 }
 
 /*
@@ -533,17 +611,19 @@ unsigned int __cdecl do_open(unsigned int es_val, unsigned int di_val)
  */
 unsigned int __cdecl do_spopen(unsigned int es_val, unsigned int di_val)
 {
-    if (last_component_is("GAMES")) {
-        if (rbuf.enabled) rb_write("2F 112E SPOP GAMES DENIED\r\n");
-        return 5;
+    int i;
+    for (i = 0; i < fs_get_root_count(); i++) {
+        if (!last_component_is(root_entries[i].name)) continue;
+        if (root_entries[i].attr & 0x10) {
+            if (rbuf.enabled) rb_write("2F 112E SPOP DENIED\r\n");
+            return 5;
+        }
+        if (rbuf.enabled) rb_write("2F 112E SPOP OK\r\n");
+        fill_sft_entry(i, (char far *)MK_FP(es_val, di_val));
+        return 0;
     }
-    if (!last_component_is("README.TXT")) {
-        if (rbuf.enabled) rb_write("2F 112E SPOP NOTFOUND\r\n");
-        return 2;
-    }
-    if (rbuf.enabled) rb_write("2F 112E SPOP README\r\n");
-    fill_sft_readme((char far *)MK_FP(es_val, di_val));
-    return 0;
+    if (rbuf.enabled) rb_write("2F 112E SPOP NOTFOUND\r\n");
+    return 2;
 }
 
 /*
@@ -562,28 +642,33 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
     unsigned int dta_off, dta_seg;
     unsigned long pos;
     unsigned int avail, count, i;
+    FsEntry *e;
+    int idx;
 
-    /* Read buffer = SDA->curr_dta (far ptr at SDA+0x0C) */
+    idx = (unsigned char)sft[0x0B];
+    if (idx >= fs_get_root_count()) return 0;
+    e = fs_get_root_entry(idx);
+    if (!e->content) return 0;
+
     dta_off = (unsigned int)(unsigned char)sda[0x0C]
             | ((unsigned int)(unsigned char)sda[0x0D] << 8);
     dta_seg = (unsigned int)(unsigned char)sda[0x0E]
             | ((unsigned int)(unsigned char)sda[0x0F] << 8);
     buf = (char far *)MK_FP(dta_seg, dta_off);
 
-    /* Read file_pos from SFT+0x15 (dword, little-endian) */
     pos = (unsigned long)(unsigned char)sft[0x15]
         | ((unsigned long)(unsigned char)sft[0x16] << 8)
         | ((unsigned long)(unsigned char)sft[0x17] << 16)
         | ((unsigned long)(unsigned char)sft[0x18] << 24);
 
-    if (pos >= README_SIZE) {
+    if (pos >= e->size) {
         if (rbuf.enabled) rb_write("2F 1108 EOF\r\n");
         return 0;
     }
-    avail = README_SIZE - (unsigned int)pos;
+    avail = (unsigned int)(e->size - pos);
     count = (cx_val < avail) ? cx_val : avail;
 
-    for (i = 0; i < count; i++) buf[i] = readme_content[(unsigned int)pos + i];
+    for (i = 0; i < count; i++) buf[i] = e->content[(unsigned int)pos + i];
 
     pos += count;
     sft[0x15] = (char)pos;
@@ -597,6 +682,12 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
         rb_write("\r\n");
     }
     return count;
+}
+
+/* do_diskspace: INT 2Fh AX=110Ch DISKSPACE — log only; registers set in ASM. */
+void __cdecl do_diskspace(void)
+{
+    if (rbuf.enabled) rb_write("2F 110C DISKSPACE 16MB\r\n");
 }
 
 /* do_close: INT 2Fh AX=1106h CLOSE — always return success. */

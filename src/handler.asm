@@ -21,6 +21,7 @@
 ;   0Fh  GETATTR    — return attribute from SDA->fn1
 ;   16h  OPEN       — fill SFT for README.TXT
 ;   2Eh  SPOPNFIL   — same as OPEN + CX=1 (used by TYPE/COPY in DOS 5+/6.x)
+;   0Ch  DISKSPACE  — return fake 16 MB volume info (AX/BX/CX/DX)
 ;   1Bh  FINDFIRST  — fn1+template-based directory entry dispatch
 ;   1Ch  FINDNEXT   — DTA dir_entry sequence counter
 ;   other — log + chain to old vector
@@ -38,6 +39,7 @@ extrn   _do_open            : near   ; unsigned __cdecl (unsigned es, unsigned d
 extrn   _do_spopen          : near   ; unsigned __cdecl (unsigned es, unsigned di) — 0=ok, else error
 extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx) — buf from SDA->curr_dta
 extrn   _do_close           : near   ; void __cdecl (void)
+extrn   _do_diskspace       : near   ; void __cdecl (void) — log only; registers set in ASM
 
 ;============================================================================
 _TEXT   segment byte public 'CODE'
@@ -76,6 +78,8 @@ new_int2f__ proc far
         je      handle_1106
         cmp     al, 08h
         je      handle_1108
+        cmp     al, 0Ch
+        je      handle_110C
         cmp     al, 0Fh
         je      handle_110F
         cmp     al, 16h
@@ -114,6 +118,15 @@ handle_1108:
         add     sp, 6
         mov     word ptr [bp+12], ax    ; CX = bytes read
         mov     word ptr [bp+16], 0     ; AX = 0
+        jmp     do_2f_ret_ok
+
+        ;--- AL=0Ch: DISKSPACE — fake 16 MB (8 sec/clus * 512 B/sec * 4096 clus) -
+handle_110C:
+        call    _do_diskspace
+        mov     word ptr [bp+16], 8     ; AX = sectors per cluster
+        mov     word ptr [bp+14], 4096  ; BX = available clusters
+        mov     word ptr [bp+12], 512   ; CX = bytes per sector
+        mov     word ptr [bp+10], 4096  ; DX = total clusters
         jmp     do_2f_ret_ok
 
         ;--- AL=0Fh: GETATTR — filename from SDA->fn1 ------------------------
