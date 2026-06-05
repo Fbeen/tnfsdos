@@ -14,6 +14,9 @@ asmflags      = -2 -ms
 
 objs_tsr = \
 	$(build_dir)/tsr.obj \
+	$(build_dir)/ringbuf.obj \
+	$(build_dir)/fs_fake.obj \
+	$(build_dir)/redirector.obj \
 	$(build_dir)/handler.obj
 
 all: $(build_dir)/tsr.exe $(build_dir)/showbuf.exe $(build_dir)/findtest.exe
@@ -22,6 +25,15 @@ $(build_dir):
 	mkdir -p $(build_dir)
 
 $(build_dir)/tsr.obj: $(src_dir)/tsr.c | $(build_dir)
+	$(cc) $(cflags_tsr) -fo=$@ $<
+
+$(build_dir)/ringbuf.obj: $(src_dir)/ringbuf.c | $(build_dir)
+	$(cc) $(cflags_tsr) -fo=$@ $<
+
+$(build_dir)/fs_fake.obj: $(src_dir)/fs_fake.c | $(build_dir)
+	$(cc) $(cflags_tsr) -fo=$@ $<
+
+$(build_dir)/redirector.obj: $(src_dir)/redirector.c | $(build_dir)
 	$(cc) $(cflags_tsr) -fo=$@ $<
 
 $(build_dir)/handler.obj: $(src_dir)/handler.asm | $(build_dir)
