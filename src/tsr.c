@@ -178,24 +178,37 @@ static unsigned int calc_resident_paras(void)
 #define DRIVE_T_IDX     19      /* T: = A(0)+19, 0-based               */
 #define CDS_ENTRY_SIZE  88      /* DOS 4–6: 88 bytes per CDS entry      */
 #define README_SIZE     21      /* sizeof("Hello from TNFSDRV!\r\n") - 1 */
+#define INFO_SIZE       35      /* sizeof("Written by Frank Beentjes + Claude\r\n") - 1 */
 #define VOLUME_LABEL    "TNFSDOS    "  /* 11 bytes, FCB-padded; change as needed */
 
 /* ------------------------------------------------------------------ */
 /*  Filesystem table  (replace with TNFS readdir later)                */
 /* ------------------------------------------------------------------ */
 
-static const char readme_content[] = "Hello from TNFSDRV!\r\n";
+static const char readme_content[]       = "Hello from TNFSDRV!\r\n";
+static const char info_content[]         = "Written by Frank Beentjes + Claude\r\n";
+static const char games_readme_content[] = "Hello from T:\\GAMES!\r\n";
+#define GAMES_README_SIZE 22
 
-typedef struct {
-    const char    *name;
-    unsigned char  attr;
-    unsigned long  size;
-    const char    *content;   /* NULL for directories */
+typedef struct FsEntry_s {
+    const char             *name;
+    unsigned char           attr;
+    unsigned long           size;
+    const char             *content;    /* NULL for directories */
+    const struct FsEntry_s *children;   /* NULL for files */
+    int                     child_count;
 } FsEntry;
 
+static FsEntry games_entries[] = {
+    { "PACMAN.EXE", 0x20, 0,                NULL,                NULL, 0 },
+    { "README.TXT", 0x20, GAMES_README_SIZE, games_readme_content, NULL, 0 }
+};
+#define GAMES_ENTRY_COUNT 2
+
 static FsEntry root_entries[] = {
-    { "GAMES",      0x10, 0,           NULL           },
-    { "README.TXT", 0x20, README_SIZE, readme_content }
+    { "GAMES",      0x10, 0,           NULL,           games_entries, GAMES_ENTRY_COUNT },
+    { "README.TXT", 0x20, README_SIZE, readme_content, NULL,          0                 },
+    { "INFO.TXT",   0x20, INFO_SIZE,   info_content,   NULL,          0                 }
 };
 
 #define CDS_FLAG_REMOTE 0x8000u
@@ -204,11 +217,19 @@ static FsEntry root_entries[] = {
  * Used by do_findfirst/do_findnext to read search attrs and write found_file. */
 static char far *glob_sdaptr;
 
-/* tmpl_matches: compare 11-byte FCB template at far ptr against near literal. */
+/* tmpl_matches: compare 11-byte FCB template (far) against near literal. */
 static int tmpl_matches(char far *tmpl, const char *pat)
 {
     int i;
     for (i = 0; i < 11; i++) if (tmpl[i] != pat[i]) return 0;
+    return 1;
+}
+
+/* tmpl_matches_near: near-to-near, '?' acts as wildcard. */
+static int tmpl_matches_near(const char *tmpl, const char *fcb)
+{
+    int i;
+    for (i = 0; i < 11; i++) if (tmpl[i] != '?' && tmpl[i] != fcb[i]) return 0;
     return 1;
 }
 
@@ -221,7 +242,7 @@ static int is_wildcard_template(char far *tmpl)
 }
 
 /* fn1_has_prefix: case-insensitive check whether fn1 starts with prefix. */
-static int fn1_has_prefix(char far *fn1, const char *prefix)
+static int fn1_has_prefix(const char far *fn1, const char *prefix)
 {
     int i;
     for (i = 0; prefix[i]; i++) {
@@ -249,10 +270,8 @@ static int fn1_eq(char far *fn1, const char *s)
     return (fn1[i] == '\0' || (fn1[i] == '\\' && fn1[i+1] == '\0'));
 }
 
-static int last_component_is(const char *name); /* forward decl — defined below */
-
 /* ------------------------------------------------------------------ */
-/*  Filesystem helpers                                                  */
+/*  FS backend internals  (not visible to redirector handlers)         */
 /* ------------------------------------------------------------------ */
 
 static int str_eq_ci(const char *a, const char *b)
@@ -280,6 +299,94 @@ static FsEntry *fs_find_root(const char *name)
     for (i = 0; i < fs_get_root_count(); i++)
         if (str_eq_ci(root_entries[i].name, name)) return &root_entries[i];
     return NULL;
+}
+
+static void entry_to_fcb(const char *name, char fcb[11]); /* forward decl */
+
+/* Find entry by name in an arbitrary entries array. Returns index or -1. */
+static int find_in(const FsEntry *entries, int count, const char *name)
+{
+    int i;
+    for (i = 0; i < count; i++)
+        if (str_eq_ci(entries[i].name, name)) return i;
+    return -1;
+}
+
+/* Return entries array for a dir_ctx; total count in g_dir_count.
+ * dir_ctx=0: root; dir_ctx=N: root_entries[N-1].children. */
+static int g_dir_count;
+static const FsEntry *dir_ctx_entries(int dir_ctx)
+{
+    if (dir_ctx == 0) { g_dir_count = fs_get_root_count(); return root_entries; }
+    g_dir_count = root_entries[dir_ctx - 1].child_count;
+    return root_entries[dir_ctx - 1].children;
+}
+
+/* Walk fn1 and resolve to a dir_ctx + idx (stored in g_fn1_dir_ctx / g_fn1_idx).
+ * dir_ctx=0 means root; dir_ctx=N means root_entries[N-1].children.
+ * Returns 1 on success, 0 if not found. */
+static int g_fn1_dir_ctx;
+static int g_fn1_idx;
+static int fn1_find(const char far *fn1)
+{
+    static char c1[13], c2[13];
+    const char far *p;
+    int i, n;
+
+    if (!fn1_has_prefix(fn1, "T:\\")) return 0;
+    p = fn1 + 3;
+
+    for (i = 0; i < 12 && p[i] && p[i] != '\\'; i++) c1[i] = (char)p[i];
+    c1[i] = '\0';
+    if (!c1[0]) return 0;
+
+    if (!p[i]) {
+        n = find_in(root_entries, fs_get_root_count(), c1);
+        if (n < 0) return 0;
+        g_fn1_dir_ctx = 0; g_fn1_idx = n;
+        return 1;
+    }
+
+    /* T:\<dir>\<name> */
+    p = p + i + 1;
+    for (i = 0; i < 12 && p[i] && p[i] != '\\'; i++) c2[i] = (char)p[i];
+    c2[i] = '\0';
+    if (!c2[0]) return 0;
+
+    n = find_in(root_entries, fs_get_root_count(), c1);
+    if (n < 0 || !(root_entries[n].attr & 0x10) || !root_entries[n].children) return 0;
+
+    i = find_in(root_entries[n].children, root_entries[n].child_count, c2);
+    if (i < 0) return 0;
+
+    g_fn1_dir_ctx = n + 1; g_fn1_idx = i;
+    return 1;
+}
+
+/* Return index in root_entries[] if fn1 = "T:\<name>\...", else -1. */
+static int fn1_subdir_idx(const char far *fn1)
+{
+    static char name[13];
+    const char far *p;
+    int i;
+    if (!fn1_has_prefix(fn1, "T:\\")) return -1;
+    p = fn1 + 3;
+    for (i = 0; i < 12 && p[i] && p[i] != '\\'; i++) name[i] = (char)p[i];
+    if (p[i] != '\\') return -1;
+    name[i] = '\0';
+    return find_in(root_entries, fs_get_root_count(), name);
+}
+
+/* Find entry in an arbitrary array whose FCB name matches tmpl. Returns index or -1. */
+static int fs_find_by_tmpl_in(char far *tmpl, const FsEntry *entries, int count)
+{
+    static char fcb[11];
+    int i;
+    for (i = 0; i < count; i++) {
+        entry_to_fcb(entries[i].name, fcb);
+        if (tmpl_matches(tmpl, fcb)) return i;
+    }
+    return -1;
 }
 
 /* Convert "README.TXT" → "README  TXT" (11-byte FCB format, near buffers). */
@@ -310,11 +417,12 @@ static void fill_found_from_entry(FsEntry *e, char far *found)
     found[31] = (char)((e->size >> 24) & 0xFFUL);
 }
 
-/* Fill an SFT from root_entries[idx].
- * Stores idx in sft[0x0B] (start_sector) as private tag for do_read. */
-static void fill_sft_entry(int idx, char far *sft)
+/* Fill an SFT from entries[idx] within dir_ctx.
+ * sft[0x0B] = dir_ctx, sft[0x0C] = idx — read back by do_read. */
+static void fill_sft_entry(int dir_ctx, int idx, char far *sft)
 {
-    FsEntry *e = &root_entries[idx];
+    const FsEntry *entries = dir_ctx_entries(dir_ctx);
+    const FsEntry *e = &entries[idx];
     static char fcb[11];
     int k;
     entry_to_fcb(e->name, fcb);
@@ -322,8 +430,8 @@ static void fill_sft_entry(int idx, char far *sft)
     sft[0x05] = (char)DRIVE_T_IDX;
     sft[0x06] = 0x80;
     sft[0x07] = sft[0x08] = sft[0x09] = sft[0x0A] = 0;
-    sft[0x0B] = (char)idx;   /* private: entry index, read back by do_read */
-    sft[0x0C] = 0;
+    sft[0x0B] = (char)dir_ctx;   /* private: dir context  */
+    sft[0x0C] = (char)idx;        /* private: entry index  */
     sft[0x0D] = sft[0x0E] = sft[0x0F] = sft[0x10] = 0;
     sft[0x11] = (char)(e->size         & 0xFFUL);
     sft[0x12] = (char)((e->size >>  8) & 0xFFUL);
@@ -338,28 +446,111 @@ static void fill_sft_entry(int idx, char far *sft)
 /* Return index of root entry whose FCB name matches tmpl, -1 if none. */
 static int fs_find_by_tmpl(char far *tmpl)
 {
-    int i;
-    static char fcb[11];
-    for (i = 0; i < fs_get_root_count(); i++) {
-        entry_to_fcb(root_entries[i].name, fcb);
-        if (tmpl_matches(tmpl, fcb)) return i;
-    }
-    return -1;
+    return fs_find_by_tmpl_in(tmpl, root_entries, fs_get_root_count());
 }
 
-/* If fn1 = "T:\<name>\..." and <name> is a known root entry, return that entry.
- * Returns NULL for root-level paths or unknown component. */
-static FsEntry *fn1_subdir_entry(char far *fn1)
+/* ------------------------------------------------------------------ */
+/*  FS interface  (opaque to redirector handlers)                      */
+/*                                                                      */
+/*  FsNode   — resolved filesystem entry (opaque handle).              */
+/*  FsHandle — open file, ready to read from.                          */
+/*  FsDirEnum — directory enumeration cursor.                          */
+/*                                                                      */
+/*  Backend: currently fake (root_entries[]/games_entries[]).          */
+/*  To replace with TNFS: rewrite the functions below; types stay.     */
+/* ------------------------------------------------------------------ */
+
+typedef struct { int dir_ctx; int idx; } FsNode;
+typedef struct { int dir_ctx; int idx; } FsHandle;
+typedef struct {
+    int  dir_ctx;
+    int  next_idx;
+    char tmpl[11];   /* FCB pattern, near copy of SDA template */
+} FsDirEnum;
+
+/* Resolve "T:\[subdir\]name" to an FsNode.  Returns 1 on success. */
+static int fs_resolve(const char far *path, FsNode *node)
 {
-    static char name[13];
-    char far *p;
+    if (!fn1_find(path)) return 0;
+    node->dir_ctx = g_fn1_dir_ctx;
+    node->idx     = g_fn1_idx;
+    return 1;
+}
+
+static int           fs_is_dir  (const FsNode *node) { return (dir_ctx_entries(node->dir_ctx)[node->idx].attr & 0x10) != 0; }
+static unsigned char fs_get_attr(const FsNode *node) { return dir_ctx_entries(node->dir_ctx)[node->idx].attr; }
+static unsigned long fs_get_size(const FsNode *node) { return dir_ctx_entries(node->dir_ctx)[node->idx].size; }
+static const char   *fs_get_name(const FsNode *node) { return dir_ctx_entries(node->dir_ctx)[node->idx].name; }
+
+/* Fill 32-byte found_file struct from node (for FINDFIRST/FINDNEXT). */
+static void fs_fill_found(const FsNode *node, char far *found)
+{
+    fill_found_from_entry((FsEntry *)&dir_ctx_entries(node->dir_ctx)[node->idx], found);
+}
+
+/* Initialise a read handle from a resolved node. */
+static void fs_open(const FsNode *node, FsHandle *handle)
+{
+    handle->dir_ctx = node->dir_ctx;
+    handle->idx     = node->idx;
+}
+
+/* Read up to n bytes from handle at position pos.  Returns bytes read. */
+static unsigned int fs_read(const FsHandle *handle, unsigned long pos,
+                              char far *buf, unsigned int n)
+{
+    const FsEntry *entries;
+    const FsEntry *e;
+    unsigned int avail, count, i;
+    entries = dir_ctx_entries(handle->dir_ctx);
+    if (handle->idx >= g_dir_count) return 0;
+    e = &entries[handle->idx];
+    if (!e->content || pos >= e->size) return 0;
+    avail = (unsigned int)(e->size - pos);
+    count = (n < avail) ? n : avail;
+    for (i = 0; i < count; i++) buf[i] = e->content[(unsigned int)pos + i];
+    return count;
+}
+
+/* Begin directory enumeration in path (e.g. "T:\" or "T:\GAMES\").
+ * tmpl: 11-byte far FCB template from SDA.
+ * Returns  1: valid directory found.
+ * Returns  0: path not found / not on T:.
+ * Returns -1: path component is a file, not a directory (DOS error 3). */
+static int fs_enum_begin(const char far *path, const char far *tmpl, FsDirEnum *de)
+{
+    int sub_idx, k;
+    for (k = 0; k < 11; k++) de->tmpl[k] = (char)tmpl[k];
+    de->next_idx = 0;
+    sub_idx = fn1_subdir_idx(path);
+    if (sub_idx >= 0) {
+        if (!(root_entries[sub_idx].attr & 0x10)) return -1;
+        de->dir_ctx = sub_idx + 1;
+        return 1;
+    }
+    if (!fn1_has_prefix(path, "T:\\")) return 0;
+    de->dir_ctx = 0;
+    return 1;
+}
+
+/* Advance enumeration; fills *node if a match is found.
+ * Returns 1 on match, 0 at end-of-directory. */
+static int fs_enum_next(FsDirEnum *de, FsNode *node)
+{
+    const FsEntry *entries;
+    static char fcb[11];
     int i;
-    if (!fn1_has_prefix(fn1, "T:\\")) return NULL;
-    p = fn1 + 3;
-    for (i = 0; i < 12 && p[i] && p[i] != '\\'; i++) name[i] = (char)p[i];
-    if (p[i] != '\\') return NULL;
-    name[i] = '\0';
-    return fs_find_root(name);
+    entries = dir_ctx_entries(de->dir_ctx);   /* sets g_dir_count */
+    while (de->next_idx < g_dir_count) {
+        i = de->next_idx++;
+        entry_to_fcb(entries[i].name, fcb);
+        if (tmpl_matches_near(de->tmpl, fcb)) {
+            node->dir_ctx = de->dir_ctx;
+            node->idx     = i;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -370,8 +561,8 @@ static FsEntry *fn1_subdir_entry(char far *fn1)
  */
 unsigned int __cdecl do_chdir(void)
 {
+    static FsNode node;
     char far *fn1;
-    int i;
     if (!glob_sdaptr) return 3;
     fn1 = glob_sdaptr + 0x9E;
 
@@ -379,40 +570,16 @@ unsigned int __cdecl do_chdir(void)
         if (rbuf.enabled) rb_write("2F 1105 CHDIR OK ROOT\r\n");
         return 0;
     }
-    if (fn1_has_prefix(fn1, "T:\\")) {
-        for (i = 0; i < fs_get_root_count(); i++) {
-            FsEntry *e = fs_get_root_entry(i);
-            if ((e->attr & 0x10) && last_component_is(e->name)) {
-                if (rbuf.enabled) { rb_write("2F 1105 CHDIR OK "); rb_write(e->name); rb_write("\r\n"); }
-                return 0;
-            }
-        }
+    if (fn1_has_prefix(fn1, "T:\\") && fs_resolve(fn1, &node) && fs_is_dir(&node)) {
+        if (rbuf.enabled) { rb_write("2F 1105 CHDIR OK "); rb_write(fs_get_name(&node)); rb_write("\r\n"); }
+        return 0;
     }
     if (rbuf.enabled) rb_write("2F 1105 CHDIR FAIL\r\n");
     return 3;
 }
 
-/*
- * do_findfirst: handle INT 2Fh AX=111Bh (FINDFIRST).
- *
- * Follows EtherDFS approach: use glob_sdaptr (not ES:DI) for FINDFIRST.
- *
- * Classification uses BOTH fn1 (SDA+0x9E, full canonical path) AND the FCB
- * template (SDA+0x22B).  A wildcard template alone is insufficient because
- * "T:\*.*" and "T:\GAMES\*.*" both produce "???????????".
- *
- * Decision table:
- *   fn1 starts with "T:\README.TXT\" → invalid (AX=3, CF=1)
- *   fn1 starts with "T:\GAMES\"      → GAMES dir is empty (AX=12h, CF=1)
- *   fn1 starts with "T:\"            → root context; dispatch on template:
- *       ???????????  → return GAMES, dir_entry=1 (FINDNEXT → README)
- *       README  TXT  → return README.TXT, dir_entry=2 (FINDNEXT → EOF)
- *       GAMES        → return GAMES, dir_entry=2 (FINDNEXT → EOF)
- *       other        → AX=12h, CF=1
- *   anything else   → AX=12h, CF=1
- *
- * Returns 0 on success (AX=0 CF=0), 0x12 or 3 on error (CF=1).
- */
+/* do_findfirst: INT 2Fh AX=111Bh — fn1+template → first matching entry.
+ * DTA[13]=next_idx, DTA[14]=dir_ctx persist state for FINDNEXT. */
 unsigned int __cdecl do_findfirst(void)
 {
     char far *sda = glob_sdaptr;
@@ -422,9 +589,9 @@ unsigned int __cdecl do_findfirst(void)
     char far *found;
     unsigned char srch_attr;
     unsigned int dta_off, dta_seg;
-    unsigned char dir_entry_next;
-    FsEntry *sub;   /* result of fn1_subdir_entry — not passed by address */
-    int idx, k;
+    static FsDirEnum de;
+    static FsNode node;
+    int rc, k;
 
     if (!sda) { if (rbuf.enabled) rb_write("2F 111B NO SDA\r\n"); return 0x12; }
 
@@ -443,34 +610,29 @@ unsigned int __cdecl do_findfirst(void)
     for (k = 0; k < 32; k++) found[k] = 0;
 
     if (srch_attr & 0x08u) {
+        /* Volume label: DOS-specific, not an FS operation */
         const char *lbl = VOLUME_LABEL;
         if (rbuf.enabled) rb_write("2F 111B VOLABEL OK\r\n");
         for (k = 0; k < 11; k++) found[k] = lbl[k];
         found[11] = 0x08;
-        dir_entry_next = (unsigned char)fs_get_root_count();
-    } else if ((sub = fn1_subdir_entry(fn1)) != NULL) {
-        if (sub->attr & 0x10) {
-            if (rbuf.enabled) rb_write("2F 111B SUBDIR EMPTY\r\n");
+        de.dir_ctx  = 0;
+        de.next_idx = 0xFF;  /* FINDNEXT → EOF immediately */
+    } else {
+        rc = fs_enum_begin(fn1, tmpl, &de);
+        if (rc == 0) {
+            if (rbuf.enabled) rb_write("2F 111B UNKNOWN PATH\r\n");
             return 0x12;
         }
-        if (rbuf.enabled) rb_write("2F 111B INVALID\r\n");
-        return 3;
-    } else if (!fn1_has_prefix(fn1, "T:\\")) {
-        if (rbuf.enabled) rb_write("2F 111B UNKNOWN PATH\r\n");
-        return 0x12;
-    } else if (is_wildcard_template(tmpl)) {
-        if (rbuf.enabled) rb_write("2F 111B FF ROOT FIRST\r\n");
-        fill_found_from_entry(fs_get_root_entry(0), found);
-        dir_entry_next = 1;
-    } else {
-        idx = fs_find_by_tmpl(tmpl);
-        if (idx < 0) {
+        if (rc < 0) {
+            if (rbuf.enabled) rb_write("2F 111B INVALID\r\n");
+            return 3;
+        }
+        if (!fs_enum_next(&de, &node)) {
             if (rbuf.enabled) rb_write("2F 111B NOMATCH\r\n");
             return 0x12;
         }
-        if (rbuf.enabled) { rb_write("2F 111B FF "); rb_write(root_entries[idx].name); rb_write("\r\n"); }
-        fill_found_from_entry(fs_get_root_entry(idx), found);
-        dir_entry_next = (unsigned char)fs_get_root_count();
+        if (rbuf.enabled) { rb_write("2F 111B FF "); rb_write(fs_get_name(&node)); rb_write("\r\n"); }
+        fs_fill_found(&node, found);
     }
 
     dta_off = (unsigned int)(unsigned char)sda[0x0C]
@@ -482,7 +644,8 @@ unsigned int __cdecl do_findfirst(void)
     dta[0] = (char)(DRIVE_T_IDX | 0x80);
     for (k = 0; k < 11; k++) dta[1+k] = tmpl[k];
     dta[12] = (char)srch_attr;
-    dta[13] = dir_entry_next; dta[14] = 0;
+    dta[13] = (char)de.next_idx;
+    dta[14] = (char)de.dir_ctx;
     dta[15] = 0; dta[16] = 0;
     dta[17] = 0; dta[18] = 0; dta[19] = 0; dta[20] = 0;
     for (k = 0; k < 32; k++) dta[0x15+k] = found[k];
@@ -490,42 +653,30 @@ unsigned int __cdecl do_findfirst(void)
     return 0;
 }
 
-/*
- * do_findnext: handle INT 2Fh AX=111Ch (FINDNEXT).
- *
- * For FINDNEXT, ES:DI IS the DTA (set up by our FINDFIRST).
- * Read dir_entry from DTA[13] to decide what to return next.
- *
- *   dir_entry == 1  → return README.TXT, set dir_entry = 2
- *   dir_entry >= 2  → EOF (AX=0x12, CF set)
- *
- * foundfilestruct offsets (from DOSSTRUC.H):
- *   +00  fname[11]
- *   +11  fattr
- *   +12  f1[10]
- *   +22  time_lstupd (word)
- *   +24  date_lstupd (word)
- *   +26  start_clstr (word)
- *   +28  fsize (dword)
- */
+/* do_findnext: INT 2Fh AX=111Ch — continues enumeration from DTA state. */
 unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
 {
     char far *dta   = (char far *)MK_FP(es_val, di_val);
     char far *found = glob_sdaptr + 0x1B3;
-    int idx = (unsigned char)dta[13];
+    static FsDirEnum de;
+    static FsNode node;
     int k;
 
-    if (idx >= fs_get_root_count()) {
+    de.dir_ctx  = (int)(unsigned char)dta[14];
+    de.next_idx = (int)(unsigned char)dta[13];
+    for (k = 0; k < 11; k++) de.tmpl[k] = dta[1+k];
+
+    if (!fs_enum_next(&de, &node)) {
         if (rbuf.enabled) rb_write("2F 111C EOF\r\n");
         return 0x12;
     }
 
-    if (rbuf.enabled) { rb_write("2F 111C FINDNEXT "); rb_write(root_entries[idx].name); rb_write("\r\n"); }
+    if (rbuf.enabled) { rb_write("2F 111C FINDNEXT "); rb_write(fs_get_name(&node)); rb_write("\r\n"); }
 
     for (k = 0; k < 32; k++) found[k] = 0;
-    fill_found_from_entry(&root_entries[idx], found);
+    fs_fill_found(&node, found);
 
-    dta[13] = (char)(idx + 1); dta[14] = 0;
+    dta[13] = (char)de.next_idx;  /* dir_ctx (dta[14]) unchanged */
 
     for (k = 0; k < 32; k++) dta[0x15+k] = found[k];
 
@@ -533,106 +684,69 @@ unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
 }
 
 /* ------------------------------------------------------------------ */
-/*  INT 2Fh file I/O handlers: GETATTR / OPEN / READ / CLOSE           */
+/*  DOS redirector helpers                                              */
 /* ------------------------------------------------------------------ */
 
-/*
- * last_component_is: return 1 if the last backslash-separated component of
- * SDA->fn1 (at glob_sdaptr+0x9E) equals `name` (case-insensitive).
- */
-static int last_component_is(const char *name)
+/* Fill a DOS SFT for a network file described by an FsHandle. */
+static void sft_fill_handle(const FsHandle *handle, char far *sft)
 {
-    char far *fn1 = glob_sdaptr + 0x9E;
-    char far *comp;
-    int i;
-    char pc, nc;
-
-    comp = fn1;
-    for (i = 0; fn1[i]; i++)
-        if (fn1[i] == '\\') comp = fn1 + i + 1;
-
-    for (i = 0; name[i]; i++) {
-        pc = comp[i]; nc = name[i];
-        if (!pc) return 0;
-        if (pc >= 'a' && pc <= 'z') pc -= 32;
-        if (nc >= 'a' && nc <= 'z') nc -= 32;
-        if (pc != nc) return 0;
-    }
-    return (comp[i] == '\0');
+    fill_sft_entry(handle->dir_ctx, handle->idx, sft);
 }
 
-/*
- * do_getattr: INT 2Fh AX=110Fh GET FILE ATTRIBUTES.
- * Filename is in SDA->fn1 (glob_sdaptr+0x9E).
- * Returns attribute byte on success, 0xFFFF if not found.
- * Caller (ASM) sets CX=retval, AX=0, CF=0 on success;
- *              sets AX=2, CF=1 on 0xFFFF.
- */
+/* ------------------------------------------------------------------ */
+/*  DOS redirector handlers                                             */
+/* ------------------------------------------------------------------ */
+
 unsigned int __cdecl do_getattr(void)
 {
-    int i;
+    static FsNode node;
     if (!glob_sdaptr) return 0xFFFF;
     if (rbuf.enabled) {
         rb_write("2F 110F \"");
         rb_far_str(FP_SEG(glob_sdaptr + 0x9E), FP_OFF(glob_sdaptr + 0x9E), 32);
         rb_write("\"\r\n");
     }
-    for (i = 0; i < fs_get_root_count(); i++)
-        if (last_component_is(root_entries[i].name)) return root_entries[i].attr;
-    return 0xFFFF;
+    if (!fs_resolve(glob_sdaptr + 0x9E, &node)) return 0xFFFF;
+    return fs_get_attr(&node);
 }
 
-/*
- * do_open: INT 2Fh AX=1116h OPEN.
- * Returns 0 on success, 5 (access denied) for directories, 2 (not found) otherwise.
- * SFT layout is filled by fill_sft_entry(); see its comment for field details.
- */
 unsigned int __cdecl do_open(unsigned int es_val, unsigned int di_val)
 {
-    int i;
-    for (i = 0; i < fs_get_root_count(); i++) {
-        if (!last_component_is(root_entries[i].name)) continue;
-        if (root_entries[i].attr & 0x10) {
-            if (rbuf.enabled) rb_write("2F 1116 OPEN DENIED\r\n");
-            return 5;
-        }
-        if (rbuf.enabled) rb_write("2F 1116 OPEN OK\r\n");
-        fill_sft_entry(i, (char far *)MK_FP(es_val, di_val));
-        return 0;
+    static FsNode node;
+    static FsHandle handle;
+    if (!glob_sdaptr || !fs_resolve(glob_sdaptr + 0x9E, &node)) {
+        if (rbuf.enabled) rb_write("2F 1116 OPEN NOTFOUND\r\n");
+        return 2;
     }
-    if (rbuf.enabled) rb_write("2F 1116 OPEN NOTFOUND\r\n");
-    return 2;
+    if (fs_is_dir(&node)) {
+        if (rbuf.enabled) rb_write("2F 1116 OPEN DENIED\r\n");
+        return 5;
+    }
+    if (rbuf.enabled) rb_write("2F 1116 OPEN OK\r\n");
+    fs_open(&node, &handle);
+    sft_fill_handle(&handle, (char far *)MK_FP(es_val, di_val));
+    return 0;
 }
 
-/*
- * do_spopen: INT 2Fh AX=112Eh SPOPNFIL (Special Open).
- * Used by TYPE and COPY in MS-DOS 5.0/6.x instead of regular OPEN.
- * Same SFT fill; caller (ASM) sets CX=1 (action: file opened) on success.
- */
 unsigned int __cdecl do_spopen(unsigned int es_val, unsigned int di_val)
 {
-    int i;
-    for (i = 0; i < fs_get_root_count(); i++) {
-        if (!last_component_is(root_entries[i].name)) continue;
-        if (root_entries[i].attr & 0x10) {
-            if (rbuf.enabled) rb_write("2F 112E SPOP DENIED\r\n");
-            return 5;
-        }
-        if (rbuf.enabled) rb_write("2F 112E SPOP OK\r\n");
-        fill_sft_entry(i, (char far *)MK_FP(es_val, di_val));
-        return 0;
+    static FsNode node;
+    static FsHandle handle;
+    if (!glob_sdaptr || !fs_resolve(glob_sdaptr + 0x9E, &node)) {
+        if (rbuf.enabled) rb_write("2F 112E SPOP NOTFOUND\r\n");
+        return 2;
     }
-    if (rbuf.enabled) rb_write("2F 112E SPOP NOTFOUND\r\n");
-    return 2;
+    if (fs_is_dir(&node)) {
+        if (rbuf.enabled) rb_write("2F 112E SPOP DENIED\r\n");
+        return 5;
+    }
+    if (rbuf.enabled) rb_write("2F 112E SPOP OK\r\n");
+    fs_open(&node, &handle);
+    sft_fill_handle(&handle, (char far *)MK_FP(es_val, di_val));
+    return 0;
 }
 
-/*
- * do_read: INT 2Fh AX=1108h READ.
- * ES:DI → SFT; CX = bytes requested.
- * Buffer is SDA->curr_dta (EtherDFS pattern — NOT DS:DX).
- * Reads from readme_content at current file_pos, updates SFT->file_pos.
- * Returns bytes actually read (placed in CX by caller; AX=0, CF=0).
- */
+/* do_read: INT 2Fh AX=1108h — reads from SFT handle into SDA->curr_dta. */
 unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
                               unsigned int cx_val)
 {
@@ -641,14 +755,11 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
     char far *buf;
     unsigned int dta_off, dta_seg;
     unsigned long pos;
-    unsigned int avail, count, i;
-    FsEntry *e;
-    int idx;
+    unsigned int nbytes;
+    static FsHandle handle;
 
-    idx = (unsigned char)sft[0x0B];
-    if (idx >= fs_get_root_count()) return 0;
-    e = fs_get_root_entry(idx);
-    if (!e->content) return 0;
+    handle.dir_ctx = (int)(unsigned char)sft[0x0B];
+    handle.idx     = (int)(unsigned char)sft[0x0C];
 
     dta_off = (unsigned int)(unsigned char)sda[0x0C]
             | ((unsigned int)(unsigned char)sda[0x0D] << 8);
@@ -661,27 +772,24 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
         | ((unsigned long)(unsigned char)sft[0x17] << 16)
         | ((unsigned long)(unsigned char)sft[0x18] << 24);
 
-    if (pos >= e->size) {
+    nbytes = fs_read(&handle, pos, buf, cx_val);
+    if (nbytes == 0) {
         if (rbuf.enabled) rb_write("2F 1108 EOF\r\n");
         return 0;
     }
-    avail = (unsigned int)(e->size - pos);
-    count = (cx_val < avail) ? cx_val : avail;
 
-    for (i = 0; i < count; i++) buf[i] = e->content[(unsigned int)pos + i];
-
-    pos += count;
+    pos += nbytes;
     sft[0x15] = (char)pos;
     sft[0x16] = (char)(pos >> 8);
     sft[0x17] = (char)(pos >> 16);
     sft[0x18] = (char)(pos >> 24);
 
     if (rbuf.enabled) {
-        rb_write("2F 1108 READ cnt="); rb_hex16(count);
+        rb_write("2F 1108 READ cnt="); rb_hex16(nbytes);
         rb_write(" DTA="); rb_hex16(dta_seg); rb_putc(':'); rb_hex16(dta_off);
         rb_write("\r\n");
     }
-    return count;
+    return nbytes;
 }
 
 /* do_diskspace: INT 2Fh AX=110Ch DISKSPACE — log only; registers set in ASM. */
