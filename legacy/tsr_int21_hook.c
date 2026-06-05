@@ -4,14 +4,13 @@
  * Presents drive T: to DOS by:
  *   1. Marking CDS entry 19 as a network+physical drive (flags = 0xC000).
  *   2. Handling INT 2Fh AH=11h redirector callbacks:
- *        AL=05h  CHDIR      — validate path; accept T:\ and T:\GAMES
- *        AL=06h  CLOSE      — always succeed
- *        AL=08h  READ       — serve fake README.TXT content
- *        AL=0Fh  GETATTR    — return attributes from SDA->fn1
- *        AL=16h  OPEN       — fill SFT for README.TXT
- *        AL=2Eh  SPOPNFIL   — same as OPEN (used by TYPE/COPY in DOS 5+/6.x)
- *        AL=1Bh  FINDFIRST  — fn1+template-based dispatch
- *        AL=1Ch  FINDNEXT   — DTA dir_entry sequence
+ *        AL=05h  CHDIR      — always succeed
+ *        AL=1Bh  FINDFIRST  — return fake directory listing
+ *        AL=1Ch  FINDNEXT   — return next fake entry or EOF
+ *
+ * Also contains a LEGACY INT 21h C:\TNFS path-hook (AH=4Eh/4Fh/43h)
+ * that pre-dates the redirector approach.  It is still compiled and active
+ * as a diagnostic reference; see the LEGACY section below.
  *
  * Compile: wcc -bt=dos -ms -3 -d2 -s -zu tsr.c
  * See README.md for full build and test instructions.
@@ -20,6 +19,12 @@
 #include <dos.h>
 #include <i86.h>
 #include <stdio.h>
+
+/* ------------------------------------------------------------------ */
+/*  Configuration  -  change TNFS_BASE to match the real directory     */
+/*  that exists on the DOS machine.  Rebuild after changing.           */
+/* ------------------------------------------------------------------ */
+#define TNFS_BASE   "C:\\TNFS"
 
 /* ------------------------------------------------------------------ */
 /*  Ring buffer  (no DOS calls - safe from ISR context)                */
@@ -88,6 +93,715 @@ static void rb_far_str(unsigned int seg, unsigned int off, int maxlen)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Virtual directory entries for TNFS_BASE root                       */
+/* ------------------------------------------------------------------ */
+
+/* CX low byte saved from last AH=4E call; written into DTA[0].       */
+unsigned char last_search_attr = 0x10;
+
+/*
+ * fill_dta_new: fill the DTA at ES:BX for AH=4Eh/4Fh FindFirst/Next.
+ *
+ * DTA layout (43 bytes):
+ *   +00      search attribute  (last_search_attr from caller's CX)
+ *   +01..+0B search template   ('?' wildcards)
+ *   +0C..+14 DOS internal state (left as 0)
+ *   +15      attribute of found entry
+ *   +16..+17 time
+ *   +18..+19 date
+ *   +1A..+1D file size (32-bit LE)
+ *   +1E..+2A filename (NUL-terminated, up to 12 chars + NUL)
+ *
+ * entry=0: GAMES (directory)
+ * entry=1: README.TXT (file, 123 bytes)
+ */
+void __cdecl fill_dta_new(unsigned int es_val, unsigned int bx_val,
+                           unsigned int entry)
+{
+    char far *d = (char far *)MK_FP(es_val, bx_val);
+    static const char n_games[]  = "GAMES";
+    static const char n_readme[] = "README.TXT";
+    const char *name;
+    int i;
+
+    for (i = 0; i < 43; i++) d[i] = 0;
+
+    d[0]  = last_search_attr;
+    for (i = 1; i <= 11; i++) d[i] = '?';   /* wildcard template */
+
+    if (entry == 0) {
+        d[21] = 0x10;                        /* attribute: directory */
+        name = n_games;
+    } else {
+        d[21] = 0x20;                        /* attribute: archive   */
+        d[26] = 123;                         /* size low byte        */
+        name = n_readme;
+    }
+    for (i = 0; i < 12 && name[i]; i++) d[30 + i] = name[i];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Path matching                                                       */
+/* ------------------------------------------------------------------ */
+
+static const char tnfs_base[] = TNFS_BASE;
+extern unsigned char in_tnfs_dir;   /* defined below; needed by classify_4e_content */
+
+/*
+ * path_match_base: return 1 if p begins with TNFS_BASE followed by
+ * '\' or NUL.  Comparison is case-insensitive throughout.
+ */
+static int path_match_base(const char far *p)
+{
+    int i;
+    char bc, pc;
+    for (i = 0; tnfs_base[i]; i++) {
+        bc = tnfs_base[i];
+        pc = p[i];
+        if (pc >= 'a' && pc <= 'z') pc -= 32;
+        if (bc >= 'a' && bc <= 'z') bc -= 32;
+        if (bc != pc) return 0;
+    }
+    return (p[i] == '\0' || p[i] == '\\');
+}
+
+/* match_base: exported wrapper for handler.asm */
+int __cdecl match_base(unsigned int ds_val, unsigned int dx_val)
+{
+    return path_match_base((char far *)MK_FP(ds_val, dx_val));
+}
+
+/*
+ * match_tnfs_tail: return 1 if path is the bare last component of TNFS_BASE,
+ * optionally preceded by ".\".
+ * e.g. TNFS_BASE="C:\TNFS" → matches "TNFS", "tnfs", ".\TNFS", ".\\tnfs".
+ */
+int __cdecl match_tnfs_tail(unsigned int ds_val, unsigned int dx_val)
+{
+    const char far *p = (const char far *)MK_FP(ds_val, dx_val);
+    const char *tail;
+    int i;
+    char pc, tc;
+
+    /* find last component of TNFS_BASE (text after final '\') */
+    tail = tnfs_base;
+    for (i = 0; tnfs_base[i]; i++)
+        if (tnfs_base[i] == '\\') tail = tnfs_base + i + 1;
+
+    /* allow optional ".\" prefix in the path */
+    if (p[0] == '.' && p[1] == '\\') p += 2;
+
+    /* case-insensitive match against tail */
+    for (i = 0; tail[i]; i++) {
+        pc = p[i]; tc = tail[i];
+        if (pc >= 'a' && pc <= 'z') pc -= 32;
+        if (tc >= 'a' && tc <= 'z') tc -= 32;
+        if (pc != tc) return 0;
+    }
+    return (p[i] == '\0' || p[i] == '\\');
+}
+
+/*
+ * classify_4e_content: decide what to enumerate for an AH=4Eh call.
+ * Returns:
+ *   0  chain to DOS (path is not inside TNFS_BASE)
+ *   1  enumerate TNFS_BASE root  → GAMES + README.TXT
+ *   2  enumerate TNFS_BASE\GAMES → empty for now
+ */
+int __cdecl classify_4e_content(unsigned int ds_val, unsigned int dx_val)
+{
+    const char far *p = (const char far *)MK_FP(ds_val, dx_val);
+    int blen;
+
+    if (!path_match_base(p)) {
+        /* Relative path: no drive letter and no leading '\' */
+        if (!(p[0] && p[1] == ':') && p[0] != '\\') {
+            if (rbuf.enabled) {
+                rb_write("AH=4E REL in_tnfs_dir=");
+                rb_putc((char)('0' + (in_tnfs_dir ? 1 : 0)));
+                rb_putc('\r'); rb_putc('\n');
+            }
+            if (in_tnfs_dir) return 1;
+        }
+        return 0;
+    }
+
+    for (blen = 0; tnfs_base[blen]; blen++);
+
+    /* Path is exactly TNFS_BASE, or TNFS_BASE\ or TNFS_BASE\*.* */
+    if (p[blen] == '\0') return 1;
+    if (p[blen + 1] == '\0' || p[blen + 1] == '*') return 1;
+
+    /* Look at what follows the backslash */
+    p += blen + 1;
+
+    if ((p[0]=='G'||p[0]=='g') && (p[1]=='A'||p[1]=='a') &&
+        (p[2]=='M'||p[2]=='m') && (p[3]=='E'||p[3]=='e') &&
+        (p[4]=='S'||p[4]=='s') &&
+        (p[5]=='\\' || p[5]=='\0' || p[5]=='*')) return 2;
+
+    return 1;   /* other path within TNFS_BASE: treat as root for now */
+}
+
+/*
+ * handle_43: determine AH=43h response for a path in TNFS_BASE.
+ * ax_val: caller's AX (AL=0 GET attributes, AL=1 SET attributes)
+ * Returns:
+ *   0      chain to DOS (path not in TNFS_BASE, or unknown sub-path)
+ *   0x10   return CX=0x10 (directory), AX=0
+ *   0x20   return CX=0x20 (archive file), AX=0
+ *   0x100  return AX=0, CX unchanged (SET accepted silently)
+ */
+int __cdecl handle_43(unsigned int ax_val, unsigned int ds_val,
+                      unsigned int dx_val)
+{
+    const char far *p = (const char far *)MK_FP(ds_val, dx_val);
+    int blen;
+
+    if (!path_match_base(p)) return 0;
+
+    if ((unsigned char)ax_val == 1) return 0x100;   /* SET: accept */
+
+    /* GET: determine attribute from path */
+    for (blen = 0; tnfs_base[blen]; blen++);
+
+    if (p[blen] == '\0') return 0x10;               /* TNFS_BASE itself */
+
+    p += blen + 1;                                   /* skip '\' */
+
+    if ((p[0]=='G'||p[0]=='g') && (p[1]=='A'||p[1]=='a') &&
+        (p[2]=='M'||p[2]=='m') && (p[3]=='E'||p[3]=='e') &&
+        (p[4]=='S'||p[4]=='s') && p[5]=='\0') return 0x10;
+
+    if ((p[0]=='R'||p[0]=='r') && (p[1]=='E'||p[1]=='e') &&
+        (p[2]=='A'||p[2]=='a') && (p[3]=='D'||p[3]=='d') &&
+        (p[4]=='M'||p[4]=='m') && (p[5]=='E'||p[5]=='e') &&
+        p[6]=='.'              &&
+        (p[7]=='T'||p[7]=='t') && (p[8]=='X'||p[8]=='x') &&
+        (p[9]=='T'||p[9]=='t') && p[10]=='\0') return 0x20;
+
+    return 0;   /* unknown name inside TNFS: chain */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Logging                                                             */
+/* ------------------------------------------------------------------ */
+
+void __cdecl log_handled_4e(void)
+{
+    if (!rbuf.enabled) return;
+    rb_write("HANDLED AH=4E\r\n");
+}
+
+/* entry: 0=GAMES, 1=README, 0xFF=EOF */
+void __cdecl log_handled_4f(unsigned int entry)
+{
+    if (!rbuf.enabled) return;
+    rb_write("HANDLED AH=4F");
+    if (entry == 0xFF) {
+        rb_write(" EOF");
+    } else {
+        rb_write(" ENTRY=");
+        rb_putc((char)('0' + entry));
+    }
+    rb_putc('\r');
+    rb_putc('\n');
+}
+
+/* log ALL AH=4E calls (path + search attrs) */
+void __cdecl log_4e_pre(unsigned int ds_val, unsigned int dx_val,
+                         unsigned int cx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=4E CX=");
+    rb_hex8((unsigned char)(cx_val >> 8));
+    rb_hex8((unsigned char)cx_val);
+    rb_write(" \"");
+    rb_far_str(ds_val, dx_val, 32);
+    rb_write("\"\r\n");
+}
+
+void __cdecl log_dta_dump(unsigned int es_val, unsigned int bx_val)
+{
+    char far *d = (char far *)MK_FP(es_val, bx_val);
+    int i;
+    if (!rbuf.enabled) return;
+    rb_write("DTA ");
+    rb_hex8((unsigned char)(es_val >> 8)); rb_hex8((unsigned char)es_val);
+    rb_putc(':');
+    rb_hex8((unsigned char)(bx_val >> 8)); rb_hex8((unsigned char)bx_val);
+    rb_write(" ATR=");
+    rb_hex8((unsigned char)d[21]);
+    rb_write(" SZ=");
+    rb_hex8((unsigned char)d[29]); rb_hex8((unsigned char)d[28]);
+    rb_hex8((unsigned char)d[27]); rb_hex8((unsigned char)d[26]);
+    rb_write(" NAME=\"");
+    for (i = 0; i < 13; i++) {
+        unsigned char c = (unsigned char)d[30 + i];
+        if (c == 0) break;
+        rb_putc((c >= 0x20 && c < 0x7F) ? (char)c : '.');
+    }
+    rb_write("\"\r\n");
+}
+
+/* log find_state on every AH=4F entry */
+void __cdecl log_4f_pre(unsigned int state)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=4F STATE=");
+    rb_hex8((unsigned char)state);
+    rb_write("\r\n");
+}
+
+/* AH=43h Get/Set File Attributes - log result of handle_43 */
+void __cdecl log_43_result(unsigned int result)
+{
+    if (!rbuf.enabled) return;
+    if (result == 0) {
+        rb_write("AH=43 CHAIN\r\n");
+    } else if (result == 0x100) {
+        rb_write("AH=43 SET OK\r\n");
+    } else {
+        rb_write("AH=43 ATR=");
+        rb_hex8((unsigned char)result);
+        rb_write("\r\n");
+    }
+}
+
+void __cdecl log_3d(unsigned int ds_val, unsigned int dx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=3D \"");
+    rb_far_str(ds_val, dx_val, 32);
+    rb_write("\"\r\n");
+}
+
+void __cdecl log_43(unsigned int ax_val, unsigned int ds_val,
+                    unsigned int dx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=43 AL=");
+    rb_hex8((unsigned char)ax_val);
+    rb_write(" \"");
+    rb_far_str(ds_val, dx_val, 32);
+    rb_write("\"\r\n");
+}
+
+void __cdecl log_60(unsigned int ds_val, unsigned int si_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=60 \"");
+    rb_far_str(ds_val, si_val, 32);
+    rb_write("\"\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* ================================================================== */
+/*  LEGACY: INT 21h path-hook experiment                               */
+/*  -------------------------------------------------------------------*/
+/*  The code below intercepts INT 21h to virtualise C:\TNFS.           */
+/*  It works for DIR but FCB-based size fields proved unreliable and   */
+/*  the approach cannot cleanly support a real drive letter via CDS.   */
+/*  Kept for reference; see "CDS / Redirector" section near main()     */
+/*  for the new direction.                                              */
+/* ================================================================== */
+
+/*  Non-static globals referenced by handler.asm                       */
+/* ------------------------------------------------------------------ */
+
+unsigned char in_handler = 0;
+void (__interrupt __far *old_int21)(void);
+
+/* AH=4E/4F enumeration state for active TNFS_BASE search.
+ * 0 = no active search
+ * 1 = GAMES returned by FindFirst; README.TXT is next
+ * 2 = README.TXT returned; next FindNext returns EOF      */
+unsigned char find_state = 0;
+
+/* AH=11h/12h FCB enumeration state.
+ * 0 = no active FCB search
+ * 1 = GAMES returned; next AH=12h returns EOF                 */
+unsigned char fcb_find_state = 0;
+
+/* Set to 1 by our AH=4Eh handler when it fills GAMES for TNFS_BASE.
+ * Cleared by AH=3Bh handler when the directory changes away from TNFS.
+ * Prevents intercepting extended FCB searches outside our directory. */
+unsigned char in_tnfs_dir = 0;
+unsigned char last_tnfs_fcb_eof = 0;  /* consumed by AH=59h intercept */
+
+/* ------------------------------------------------------------------ */
+/*  FCB FindFirst/FindNext support (AH=11h/12h)                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * fill_dta_fcb: fill the DTA at ES:BX in FCB search-result format.
+ * FCB result layout (37 bytes):
+ *   +00       drive (1-based; C:=3)
+ *   +01..+08  filename (8 chars, space-padded)
+ *   +09..+11  extension (3 chars, space-padded)
+ *   +12..+15  reserved
+ *   +16..+19  file size (32-bit LE)
+ * entry=0: GAMES   entry=1: README.TXT (size 123)
+ */
+void __cdecl fill_dta_fcb(unsigned int es_val, unsigned int bx_val,
+                           unsigned int entry)
+{
+    char far *d = (char far *)MK_FP(es_val, bx_val);
+    int i;
+
+    for (i = 0; i < 37; i++) d[i] = 0;
+    d[0] = 3;   /* drive: C: (1-based) */
+
+    if (entry == 0) {
+        d[1]='G'; d[2]='A'; d[3]='M'; d[4]='E'; d[5]='S';
+        d[6]=' '; d[7]=' '; d[8]=' ';
+        d[9]=' '; d[10]=' '; d[11]=' ';
+    } else {
+        d[1]='R'; d[2]='E'; d[3]='A'; d[4]='D'; d[5]='M'; d[6]='E';
+        d[7]=' '; d[8]=' ';
+        d[9]='T'; d[10]='X'; d[11]='T';
+        d[16] = 123;
+    }
+}
+
+void __cdecl log_11_pre(void)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=11 FCB\r\n");
+}
+
+/* entry: 0=GAMES */
+void __cdecl log_handled_11(unsigned int entry)
+{
+    if (!rbuf.enabled) return;
+    rb_write("HANDLED AH=11 ENTRY=");
+    rb_putc((char)('0' + entry));
+    rb_putc('\r');
+    rb_putc('\n');
+}
+
+/* entry: 1=README, 0xFF=EOF */
+void __cdecl log_handled_12(unsigned int entry)
+{
+    if (!rbuf.enabled) return;
+    rb_write("HANDLED AH=12");
+    if (entry == 0xFF) {
+        rb_write(" EOF");
+    } else {
+        rb_write(" ENTRY=");
+        rb_putc((char)('0' + entry));
+    }
+    rb_putc('\r');
+    rb_putc('\n');
+}
+
+/*
+ * fill_dta_fcb_ext: fill DTA with an extended FCB search result.
+ * Used when AH=11h was called with an extended FCB (byte[0] == 0xFF).
+ *
+ * Extended FCB result layout (37 bytes):
+ *   +00     0xFF  (extended FCB marker)
+ *   +01..+05  00  (reserved)
+ *   +06     file attribute (0x10=directory)
+ *   +07     drive code (1-based; C:=3)
+ *   +08..+15  filename (8 chars, space-padded)
+ *   +16..+18  extension (3 chars, space-padded)
+ *   +19..+35  zero (block, size, date, time, etc.)
+ *
+ * Only entry=0 (GAMES) implemented; README.TXT deferred until file I/O works.
+ */
+void __cdecl fill_dta_fcb_ext(unsigned int es_val, unsigned int bx_val,
+                               unsigned int entry)
+{
+    char far *d = (char far *)MK_FP(es_val, bx_val);
+    int i;
+
+    for (i = 0; i < 64; i++) d[i] = 0;
+    d[0] = (char)0xFF;  /* extended FCB marker */
+    d[7] = 3;           /* drive C: (1-based)  */
+
+    if (entry == 0) {
+        d[6]  = 0x10;   /* attribute: directory */
+        d[8] ='G'; d[9] ='A'; d[10]='M'; d[11]='E'; d[12]='S';
+        d[13]=' '; d[14]=' '; d[15]=' ';
+        d[16]=' '; d[17]=' '; d[18]=' ';
+    } else {
+        d[6]  = 0x20;   /* attribute: archive */
+        d[8] ='R'; d[9] ='E'; d[10]='A'; d[11]='D'; d[12]='M'; d[13]='E';
+        d[14]=' '; d[15]=' ';
+        d[16]='T'; d[17]='X'; d[18]='T';
+        /* Hypothesis: offset 23 (0x17) is the attribute byte in this COMMAND.COM's
+         * FCB result layout; the earlier probe had 0x22 there which set bit 0x10
+         * (directory).  Set 0x20 (archive) to test: if README stops showing <DIR>
+         * then offset 23 is indeed the attribute. */
+        d[23]=0x20;
+        /* Size probe at offset 26 (0x1A).  Try 0x7B = 123. */
+        d[26]=0x7B; d[27]=0x00; d[28]=0x00; d[29]=0x00;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Diagnostic logging (no behaviour change, chain-only calls)         */
+/* ------------------------------------------------------------------ */
+
+/* AH=29h Parse Filename - input string at DS:SI */
+void __cdecl log_29(unsigned int ax_val, unsigned int ds_val,
+                    unsigned int si_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=29 AL=");
+    rb_hex8((unsigned char)ax_val);
+    rb_write(" \"");
+    rb_far_str(ds_val, si_val, 32);
+    rb_write("\"\r\n");
+}
+
+/* AH=1Ah Set DTA - new DTA at DS:DX */
+void __cdecl log_1a(unsigned int ds_val, unsigned int dx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=1A DTA=");
+    rb_hex8((unsigned char)(ds_val >> 8)); rb_hex8((unsigned char)ds_val);
+    rb_putc(':');
+    rb_hex8((unsigned char)(dx_val >> 8)); rb_hex8((unsigned char)dx_val);
+    rb_write("\r\n");
+}
+
+/* AH=2Fh Get DTA - return hook: ES:BX = current DTA */
+void __cdecl log_2f_return(unsigned int es_val, unsigned int bx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=2F DTA=");
+    rb_hex8((unsigned char)(es_val >> 8)); rb_hex8((unsigned char)es_val);
+    rb_putc(':');
+    rb_hex8((unsigned char)(bx_val >> 8)); rb_hex8((unsigned char)bx_val);
+    rb_write("\r\n");
+}
+
+/* AH=3Bh Change Directory - path at DS:DX */
+void __cdecl log_3b(unsigned int ds_val, unsigned int dx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=3B \"");
+    rb_far_str(ds_val, dx_val, 32);
+    rb_write("\"\r\n");
+}
+
+/* AH=3Bh decision log: flag=1 entering TNFS, flag=0 leaving */
+void __cdecl log_3b_set(unsigned int flag)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=3B SET in_tnfs_dir=");
+    rb_putc((char)('0' + (flag ? 1 : 0)));
+    rb_putc('\r'); rb_putc('\n');
+}
+
+/* AH=47h Get Current Directory - DL = drive (1-based) */
+void __cdecl log_47(unsigned int dx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=47 DL=");
+    rb_hex8((unsigned char)dx_val);
+    rb_write("\r\n");
+}
+
+/* AH=4Eh FindFirst - DTA address obtained from AH=2Fh, before fill */
+void __cdecl log_4e_dta(unsigned int es_val, unsigned int bx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=4E DTA=");
+    rb_hex8((unsigned char)(es_val >> 8)); rb_hex8((unsigned char)es_val);
+    rb_putc(':');
+    rb_hex8((unsigned char)(bx_val >> 8)); rb_hex8((unsigned char)bx_val);
+    rb_write("\r\n");
+}
+
+/* AH=11h FCB FindFirst - raw hex dump of first 32 FCB bytes at DS:DX.
+ * Does not try to parse: drv=FF means extended FCB with a different layout. */
+void __cdecl log_11_fcb_raw(unsigned int ds_val, unsigned int dx_val)
+{
+    char far *fcb = (char far *)MK_FP(ds_val, dx_val);
+    int i;
+    if (!rbuf.enabled) return;
+    rb_write("AH=11 FCB DS:DX=");
+    rb_hex8((unsigned char)(ds_val >> 8)); rb_hex8((unsigned char)ds_val);
+    rb_putc(':');
+    rb_hex8((unsigned char)(dx_val >> 8)); rb_hex8((unsigned char)dx_val);
+    rb_write(" [");
+    for (i = 0; i < 32; i++) {
+        if (i > 0) rb_putc(' ');
+        rb_hex8((unsigned char)fcb[i]);
+    }
+    rb_write("]\r\n");
+}
+
+/*
+ * fcb_set_state / fcb_get_state: manage TNFS private continuation state
+ * stored in the caller's extended FCB reserved bytes [1..5]:
+ *   [1..4] = 'T','N','F','S' marker
+ *   [5]    = state byte (1=next README, 2=EOF)
+ * state=0 means clear the marker (search exhausted or not ours).
+ */
+void __cdecl fcb_set_state(unsigned int ds_val, unsigned int dx_val,
+                            unsigned int state)
+{
+    char far *fcb = (char far *)MK_FP(ds_val, dx_val);
+    if (state == 0) {
+        fcb[1] = fcb[2] = fcb[3] = fcb[4] = fcb[5] = 0;
+    } else {
+        fcb[1] = 'T'; fcb[2] = 'N'; fcb[3] = 'F'; fcb[4] = 'S';
+        fcb[5] = (char)state;
+    }
+}
+
+/* Write README.TXT size 123 (0x7B) into extended FCB at caller's DS:DX offset 0x17.
+ * 0x17 is the documented extended FCB file-size DWORD field. */
+void __cdecl fcb_set_readme_size(unsigned int ds_val, unsigned int dx_val)
+{
+    char far *fcb = (char far *)MK_FP(ds_val, dx_val);
+    fcb[0x15] = 0x80; fcb[0x16] = 0x00;  /* logical record size = 128 */
+    fcb[0x17] = 0x7B;
+    fcb[0x18] = 0x00;
+    fcb[0x19] = 0x00;
+    fcb[0x1A] = 0x00;
+}
+
+/* Returns TNFS state byte (1 or 2), or 0 if marker absent. */
+unsigned int __cdecl fcb_get_state(unsigned int ds_val, unsigned int dx_val)
+{
+    const char far *fcb = (const char far *)MK_FP(ds_val, dx_val);
+    if (fcb[1]=='T' && fcb[2]=='N' && fcb[3]=='F' && fcb[4]=='S')
+        return (unsigned char)fcb[5];
+    return 0;
+}
+
+/*
+ * log_fcb_bytes: dump first 20 bytes of caller's FCB with a phase tag.
+ * tag 0 = "11PRE", 1 = "11POST", 2 = "12PRE", 3 = "12POST"
+ */
+void __cdecl log_fcb_bytes(unsigned int ds_val, unsigned int dx_val,
+                            unsigned int tag)
+{
+    const char far *fcb = (const char far *)MK_FP(ds_val, dx_val);
+    int i;
+    if (!rbuf.enabled) return;
+    if      (tag == 0) rb_write("11PRE");
+    else if (tag == 1) rb_write("11POST");
+    else if (tag == 2) rb_write("12PRE");
+    else               rb_write("12POST");
+    rb_write(" FCB [");
+    for (i = 0; i < 32; i++) {
+        if (i > 0) rb_putc(' ');
+        rb_hex8((unsigned char)fcb[i]);
+    }
+    rb_write("]\r\n");
+}
+
+/* Raw hex dump of 40 bytes from ES:BX — used after fill_dta_fcb_ext to locate size field */
+void __cdecl log_fcb_result_raw(unsigned int es_val, unsigned int bx_val)
+{
+    char far *d = (char far *)MK_FP(es_val, bx_val);
+    int i;
+    if (!rbuf.enabled) return;
+    rb_write("FCB_DTA [");
+    for (i = 0; i < 64; i++) {
+        if (i > 0) rb_putc(' ');
+        rb_hex8((unsigned char)d[i]);
+    }
+    rb_write("]\r\n");
+}
+
+/* AH=12h FCB FindNext - log call, chain to DOS */
+void __cdecl log_12_pre(void)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=12 FCB\r\n");
+}
+
+/* AH=12h chained to DOS - log what DOS returned in AX (AL=00 found, AL=FF EOF) */
+void __cdecl log_12_chain_return(unsigned int ax_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=12 DOS AL=");
+    rb_hex8((unsigned char)ax_val);
+    rb_write("\r\n");
+}
+
+/* AH=12h FCB FindNext - log immediately before return: what was in AX and what AL becomes */
+void __cdecl log_12_return(unsigned int saved_ax, unsigned int final_al)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=12 RET saved_AX=");
+    rb_hex8((unsigned char)(saved_ax >> 8)); rb_hex8((unsigned char)saved_ax);
+    rb_write(" final_AL=");
+    rb_hex8((unsigned char)final_al);
+    rb_write("\r\n");
+}
+
+/* AH=59h Get Extended Error - return hook: AX=error BH=class BL=action CH=locus */
+void __cdecl log_59_return(unsigned int ax_val, unsigned int bx_val,
+                            unsigned int cx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=59 AX=");
+    rb_hex8((unsigned char)(ax_val >> 8)); rb_hex8((unsigned char)ax_val);
+    rb_write(" BH="); rb_hex8((unsigned char)(bx_val >> 8));  /* error class  */
+    rb_write(" BL="); rb_hex8((unsigned char)bx_val);          /* action       */
+    rb_write(" CH="); rb_hex8((unsigned char)(cx_val >> 8));   /* locus        */
+    rb_write("\r\n");
+}
+
+/* AH=6Ch Extended Open/Create - path at DS:SI (not DS:DX!), BX=mode, DX=action */
+void __cdecl log_6c(unsigned int ds_val, unsigned int si_val,
+                    unsigned int bx_val, unsigned int dx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=6C BX=");
+    rb_hex8((unsigned char)(bx_val >> 8)); rb_hex8((unsigned char)bx_val);
+    rb_write(" DX=");
+    rb_hex8((unsigned char)(dx_val >> 8)); rb_hex8((unsigned char)dx_val);
+    rb_write(" \"");
+    rb_far_str(ds_val, si_val, 64);
+    rb_write("\"\r\n");
+}
+
+/* AH=42h Move File Pointer - AL=origin, BX=handle, CX:DX=offset */
+void __cdecl log_42(unsigned int ax_val, unsigned int bx_val,
+                    unsigned int cx_val, unsigned int dx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=42 BX=");
+    rb_hex8((unsigned char)(bx_val >> 8)); rb_hex8((unsigned char)bx_val);
+    rb_write(" AL=");
+    rb_hex8((unsigned char)ax_val);
+    rb_write(" CX:DX=");
+    rb_hex8((unsigned char)(cx_val >> 8)); rb_hex8((unsigned char)cx_val);
+    rb_putc(':');
+    rb_hex8((unsigned char)(dx_val >> 8)); rb_hex8((unsigned char)dx_val);
+    rb_write("\r\n");
+}
+
+/* AH=3Fh Read from File - BX=handle, CX=bytes requested */
+void __cdecl log_3f(unsigned int bx_val, unsigned int cx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=3F BX=");
+    rb_hex8((unsigned char)(bx_val >> 8)); rb_hex8((unsigned char)bx_val);
+    rb_write(" CX=");
+    rb_hex8((unsigned char)(cx_val >> 8)); rb_hex8((unsigned char)cx_val);
+    rb_write("\r\n");
+}
+
+/* AH=3Eh Close File - BX=handle */
+void __cdecl log_3e(unsigned int bx_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=3E BX=");
+    rb_hex8((unsigned char)(bx_val >> 8)); rb_hex8((unsigned char)bx_val);
+    rb_write("\r\n");
+}
+
 /* INT 2Fh AH=11h redirector call.
  * Volume control: full regs only for AX=1123/1125; one line for everything else. */
 void __cdecl log_2f_call(unsigned int ax_val, unsigned int bx_val, unsigned int cx_val,
@@ -118,8 +832,23 @@ void __cdecl log_2f_call(unsigned int ax_val, unsigned int bx_val, unsigned int 
 }
 
 /* ------------------------------------------------------------------ */
+/*  Catch-all log                                                       */
+/* ------------------------------------------------------------------ */
+
+void __cdecl log_int21(unsigned int ax_val)
+{
+    if (!rbuf.enabled) return;
+    rb_write("AH=");
+    rb_hex8((unsigned char)(ax_val >> 8));
+    rb_putc('\r');
+    rb_putc('\n');
+}
+
+/* ------------------------------------------------------------------ */
 /*  ASM handler interface                                               */
 /* ------------------------------------------------------------------ */
+extern void new_int21_(void);
+extern void init_cs_ptr_(void);
 extern void new_int2f_(void);
 extern void init_int2f_ptr_(void);
 
@@ -775,7 +1504,12 @@ int main(void)
 
     rb_write("TNFSDRV loaded OK\r\n");
 
+    /* CDS setup runs before the INT 21h hook so it calls clean DOS directly. */
     init_cds();
+
+    old_int21 = _dos_getvect(0x21);
+    init_cs_ptr_();
+    _dos_setvect(0x21, (void (__interrupt __far *)())new_int21_);
 
     old_int2f = _dos_getvect(0x2F);
     init_int2f_ptr_();
@@ -784,7 +1518,7 @@ int main(void)
     paras = calc_resident_paras();
     seg   = get_ds();
     off   = (unsigned int)&rbuf;
-    printf("TNFSDRV: virtual drive T:\r\n");
+    printf("TNFSDRV: hooking %s\r\n", TNFS_BASE);
     printf("Ring buffer at %04X:%04X\r\n", seg, off);
     printf("Run: SHOWBUF %04X:%04X\r\n", seg, off);
     printf("Staying resident (%u paragraphs).\r\n", paras);
