@@ -12,13 +12,21 @@ cc    = wcc
 cpp   = wpp
 asm   = wasm
 
-cflags_tsr   = -bt=dos -ms -3 -d2 -s -zu -I$(inc_dir)
-cflags_tools = -bt=dos -ms -3 -d2 -s -I$(inc_dir)
+ifdef DEBUG
+  debug_flag = -DTNFSDRV_DEBUG_RINGBUF
+  all: $(build_dir)/tnfsdrv.exe $(build_dir)/dumpbuf.exe
+else
+  debug_flag =
+  all: $(build_dir)/tnfsdrv.exe
+endif
+
+cflags_tsr   = -bt=dos -ms -3 -d2 -s -zu $(debug_flag) -I$(inc_dir)
+cflags_tools = -bt=dos -ms -3 -d2 -s $(debug_flag) -I$(inc_dir)
 
 # mTCP C++ objects and network C files: 8086, small model, no -zu
 # -zp2: pack structs to 2-byte alignment (matches mTCP internals)
 # -zpw: suppress packed struct warnings
-cflags_mtcp = -bt=dos -ms -0 -s -zp2 -zpw \
+cflags_mtcp = -bt=dos -ms -0 -s -zp2 -zpw $(debug_flag) \
               -DCFG_H='"tnfsdrv.cfg"' \
               -I$(tcp_h_dir) -I$(inc_dir) -I$(src_dir)
 
@@ -45,8 +53,6 @@ objs_tnfsdrv = \
 	$(build_dir)/netw.obj \
 	$(build_dir)/tnfs.obj \
 	$(tcpobjs)
-
-all: $(build_dir)/tnfsdrv.exe $(build_dir)/dumpbuf.exe
 
 $(build_dir):
 	mkdir -p $(build_dir)

@@ -1,6 +1,8 @@
 #include <i86.h>
 #include "ringbuf.h"
 
+#ifdef TNFSDRV_DEBUG_RINGBUF
+
 RingBuf rbuf;
 
 void rb_putc(char c)
@@ -76,3 +78,18 @@ void __cdecl log_2f_call(unsigned int ax_val, unsigned int bx_val,
         rb_write("  SI\""); rb_far_str(ds_val, si_val, 48); rb_write("\"\r\n");
     }
 }
+
+#else /* release build */
+
+RingBuf rbuf = { 0 };
+
+void __cdecl log_2f_call(unsigned int ax_val, unsigned int bx_val,
+                          unsigned int cx_val, unsigned int dx_val,
+                          unsigned int ds_val, unsigned int si_val,
+                          unsigned int es_val, unsigned int di_val)
+{
+    (void)ax_val; (void)bx_val; (void)cx_val; (void)dx_val;
+    (void)ds_val; (void)si_val; (void)es_val; (void)di_val;
+}
+
+#endif /* TNFSDRV_DEBUG_RINGBUF */

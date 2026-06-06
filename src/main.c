@@ -179,13 +179,18 @@ int main(int argc, char *argv[])
 {
     static TnfsDrvConfig cfg;
     const char   *profile;
-    unsigned int  seg, off, paras;
+#ifdef TNFSDRV_DEBUG_RINGBUF
+    unsigned int  seg, off;
+#endif
+    unsigned int  paras;
 
+#ifdef TNFSDRV_DEBUG_RINGBUF
     rbuf.magic   = RING_MAGIC;
     rbuf.head    = 0;
     rbuf.tail    = 0;
     rbuf.size    = RING_SIZE;
     rbuf.enabled = 1;
+#endif
 
     profile = (argc > 1) ? argv[1] : "default";
 
@@ -230,12 +235,13 @@ int main(int argc, char *argv[])
     _dos_setvect(0x2F, (void (__interrupt __far *)())new_int2f_);
 
     paras = calc_resident_paras();
-    seg   = get_ds();
-    off   = (unsigned int)&rbuf;
-
     printf("Virtual drive %c: installed\r\n", cfg.driveletter);
+#ifdef TNFSDRV_DEBUG_RINGBUF
+    seg = get_ds();
+    off = (unsigned int)&rbuf;
     printf("Ring buffer at %04X:%04X\r\n", seg, off);
     printf("Run: DUMPBUF %04X:%04X\r\n", seg, off);
+#endif
     printf("Staying resident (%u paragraphs).\r\n", paras);
 
     {
