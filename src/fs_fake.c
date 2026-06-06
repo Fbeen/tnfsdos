@@ -11,6 +11,18 @@
 #include "fs.h"
 #include "ringbuf.h"
 
+/* Drive letter arrays — written once by fs_set_drive() before TSR install. */
+unsigned char g_drive_idx            = (unsigned char)DRIVE_IDX;
+static char   s_drv_prefix[4]        = { (char)TNFSDRV_DRIVE_LETTER, ':', '\\', '\0' };
+static char   s_drv_root[3]          = { (char)TNFSDRV_DRIVE_LETTER, ':', '\0' };
+
+void fs_set_drive(char letter)
+{
+    g_drive_idx     = (unsigned char)(letter - 'A');
+    s_drv_prefix[0] = letter;
+    s_drv_root[0]   = letter;
+}
+
 /* ------------------------------------------------------------------ */
 /*  Content strings and sizes                                           */
 /* ------------------------------------------------------------------ */
@@ -137,7 +149,7 @@ static int fn1_find(const char far *fn1)
     const char far *p;
     int i, n;
 
-    if (!fn1_has_prefix(fn1, "T:\\")) return 0;
+    if (!fn1_has_prefix(fn1, s_drv_prefix)) return 0;
     p = fn1 + 3;
 
     for (i = 0; i < 12 && p[i] && p[i] != '\\'; i++) c1[i] = (char)p[i];
@@ -171,7 +183,7 @@ static int fn1_subdir_idx(const char far *fn1)
     static char name[13];
     const char far *p;
     int i;
-    if (!fn1_has_prefix(fn1, "T:\\")) return -1;
+    if (!fn1_has_prefix(fn1, s_drv_prefix)) return -1;
     p = fn1 + 3;
     for (i = 0; i < 12 && p[i] && p[i] != '\\'; i++) name[i] = (char)p[i];
     if (p[i] != '\\') return -1;
@@ -213,7 +225,7 @@ static void fill_sft_entry(int dir_ctx, int idx, char far *sft)
     int k;
     entry_to_fcb(e->name, fcb);
     sft[0x04] = e->attr;
-    sft[0x05] = (char)DRIVE_T_IDX;
+    sft[0x05] = (char)g_drive_idx;
     sft[0x06] = 0x80;
     sft[0x07] = sft[0x08] = sft[0x09] = sft[0x0A] = 0;
     sft[0x0B] = (char)dir_ctx;
@@ -246,7 +258,7 @@ static int fs_find_by_tmpl_in(char far *tmpl, const FsEntry *entries, int count)
 
 int fs_is_root(const char far *path)
 {
-    return fn1_eq(path, "T:\\") || fn1_eq(path, "T:");
+    return fn1_eq(path, s_drv_prefix) || fn1_eq(path, s_drv_root);
 }
 
 int fs_resolve(const char far *path, FsNode *node)
@@ -305,7 +317,7 @@ int fs_enum_begin(const char far *path, const char far *tmpl, FsDirEnum *de)
         de->dir_ctx = sub_idx + 1;
         return 1;
     }
-    if (!fn1_has_prefix(path, "T:\\")) return 0;
+    if (!fn1_has_prefix(path, s_drv_prefix)) return 0;
     de->dir_ctx = 0;
     return 1;
 }

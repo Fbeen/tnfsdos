@@ -1,24 +1,25 @@
 /*
- * TSR.C  —  TNFSDRV: TSR install + CDS initialisation.
+ * MAIN.C  —  TNFSDRV: TSR install + CDS initialisation.
+ *
+ * Usage:
+ *   TNFSDRV              — uses [default] profile from TNFSDRV.CFG
+ *   TNFSDRV <profile>    — uses [<profile>] section from TNFSDRV.CFG
  *
  * Responsibilities:
- *   - Find the DOS List of Lists and set up CDS entry for T:
+ *   - Load TNFSDRV.CFG and configure drive letter / server parameters
+ *   - Find the DOS List of Lists and set up CDS entry for the virtual drive
  *   - Hook INT 2Fh to our handler
  *   - Stay resident (INT 21h AH=31h)
- *
- * All INT 2Fh handler logic lives in:
- *   redirector.c  (do_chdir, do_findfirst, …, do_close, do_diskspace)
- *   fs_fake.c     (filesystem backend — FsEntry table, fs_resolve, …)
- *   ringbuf.c     (ring buffer logging)
- *   handler.asm   (INT 2Fh trampoline + dispatch)
  */
 
 #include <dos.h>
 #include <i86.h>
 #include <stdio.h>
+#include <string.h>
 #include "ringbuf.h"
 #include "fs.h"
 #include "redirector.h"
+#include "netinit.h"
 
 /* ------------------------------------------------------------------ */
 /*  ASM handler interface                                               */
@@ -44,18 +45,16 @@ static unsigned int calc_resident_paras(void)
 /* ------------------------------------------------------------------ */
 /*  CDS constants                                                       */
 /*                                                                      */
-/* DRIVE_T_IDX = 19  (A=0 … T=19) — defined in fs.h                   */
 /* CDS_ENTRY_SIZE = 88: fixed for DOS 4–6 (DOSSTRUC.H cdsstruct)       */
 /*   +0x00  current_path[67]                                            */
 /*   +0x43  flags (word)  NET|PHY = 0xC000                             */
 /*   +0x45  dpb_ptr (4 bytes) NULL for network drives                  */
 /*   +0x49  net_union (6 bytes)                                         */
-/*   +0x4F  backslash_offset = 2 for "T:\"                             */
+/*   +0x4F  backslash_offset = 2 for "X:\"                             */
 /*   +0x51  DOS 4+ reserved[7]                                          */
 /* ------------------------------------------------------------------ */
 
 #define CDS_ENTRY_SIZE  88
-#define CDS_FLAG_REMOTE 0x8000u
 
 /* ------------------------------------------------------------------ */
 /*  DOS internals helpers                                               */
@@ -73,12 +72,13 @@ static void far *get_lol(void)
     return u.p;
 }
 
-static void init_cds(void)
+static void init_cds(const TnfsDrvConfig *cfg)
 {
     static union REGS r;
     static struct SREGS sr;
     char far *lol;
     int i, j;
+    int drive_idx = (int)((unsigned char)(cfg->driveletter - 'A'));
 
     rb_write("INIT_CDS START\r\n");
 
@@ -113,7 +113,7 @@ static void init_cds(void)
         cds_base = (char far *)MK_FP(cds_seg, cds_off);
         rb_write("CDS="); rb_hex16(cds_seg); rb_putc(':'); rb_hex16(cds_off); rb_write("\r\n");
 
-        for (i = 0; i <= DRIVE_T_IDX; i++) {
+        for (i = 0; i <= drive_idx; i++) {
             entry = cds_base + (unsigned)(i * CDS_ENTRY_SIZE);
             flags = (unsigned int)(unsigned char)entry[0x43]
                   | ((unsigned int)(unsigned char)entry[0x44] << 8);
@@ -130,17 +130,18 @@ static void init_cds(void)
         if (r.w.ax == 0x0001) {
             rb_write("REDIR NOT AVAILABLE\r\n");
         } else {
-            entry = cds_base + (unsigned)(DRIVE_T_IDX * CDS_ENTRY_SIZE);
+            entry = cds_base + (unsigned)(drive_idx * CDS_ENTRY_SIZE);
             flags = (unsigned int)(unsigned char)entry[0x43]
                   | ((unsigned int)(unsigned char)entry[0x44] << 8);
             bsoff = (unsigned int)(unsigned char)entry[0x4F]
                   | ((unsigned int)(unsigned char)entry[0x50] << 8);
-            rb_write("CDS19_BEFORE path=\"");
+            rb_write("CDS_BEFORE path=\"");
             rb_far_str(FP_SEG(entry), FP_OFF(entry), 16);
             rb_write("\" FL="); rb_hex16(flags);
             rb_write(" BS="); rb_hex16(bsoff); rb_write("\r\n");
 
-            entry[0] = 'T'; entry[1] = ':'; entry[2] = '\\'; entry[3] = '\0';
+            entry[0] = cfg->driveletter;
+            entry[1] = ':'; entry[2] = '\\'; entry[3] = '\0';
             for (i = 4; i < 67; i++) entry[i] = 0;
 
             flags = (unsigned int)(unsigned char)entry[0x43]
@@ -160,7 +161,7 @@ static void init_cds(void)
                   | ((unsigned int)(unsigned char)entry[0x44] << 8);
             bsoff = (unsigned int)(unsigned char)entry[0x4F]
                   | ((unsigned int)(unsigned char)entry[0x50] << 8);
-            rb_write("CDS19_AFTER path=\"");
+            rb_write("CDS_AFTER path=\"");
             rb_far_str(FP_SEG(entry), FP_OFF(entry), 16);
             rb_write("\" FL="); rb_hex16(flags);
             rb_write(" BS="); rb_hex16(bsoff); rb_write("\r\n");
@@ -174,9 +175,11 @@ static void init_cds(void)
 /*  TSR install                                                         */
 /* ------------------------------------------------------------------ */
 
-int main(void)
+int main(int argc, char *argv[])
 {
-    unsigned int seg, off, paras;
+    static TnfsDrvConfig cfg;
+    const char   *profile;
+    unsigned int  seg, off, paras;
 
     rbuf.magic   = RING_MAGIC;
     rbuf.head    = 0;
@@ -184,9 +187,43 @@ int main(void)
     rbuf.size    = RING_SIZE;
     rbuf.enabled = 1;
 
+    profile = (argc > 1) ? argv[1] : "default";
+
+    if (!config_load("TNFSDRV.CFG", profile, &cfg))
+        rb_write("TNFSDRV.CFG not found, using defaults\r\n");
+
+    /* Validate protocol */
+    if (strcmp(cfg.protocol, "UDP") != 0) {
+        printf("TNFSDRV: protocol '%s' not supported (only UDP)\r\n", cfg.protocol);
+        return 1;
+    }
+
+    /* Validate drive letter: C-Z only (A/B are floppy; anything outside A-Z is garbage) */
+    if (cfg.driveletter < 'C' || cfg.driveletter > 'Z') {
+        printf("TNFSDRV: invalid drive '%c:' — use C-Z\r\n", cfg.driveletter);
+        return 1;
+    }
+
+    /* Show config before installing */
+    printf("Profile:  %s\r\n",  cfg.profile);
+    printf("Server:   %s\r\n",  cfg.servername[0] ? cfg.servername : "(none)");
+    printf("Root:     %s\r\n",  cfg.serverroot);
+    printf("Protocol: %s\r\n",  cfg.protocol);
+    printf("Port:     %u\r\n",  cfg.port);
+    printf("Drive:    %c:\r\n", cfg.driveletter);
+
+    /* Network: connect to TNFS server and verify reachability */
+    if (tnfsdrv_connect(&cfg) != 0) {
+        return 1;
+    }
+    tnfsdrv_disconnect();   /* unhook mTCP timer before going TSR */
+
+    /* Apply runtime drive letter to FS layer */
+    fs_set_drive(cfg.driveletter);
+
     rb_write("TNFSDRV loaded OK\r\n");
 
-    init_cds();
+    init_cds(&cfg);
 
     old_int2f = _dos_getvect(0x2F);
     init_int2f_ptr_();
@@ -195,9 +232,10 @@ int main(void)
     paras = calc_resident_paras();
     seg   = get_ds();
     off   = (unsigned int)&rbuf;
-    printf("TNFSDRV: virtual drive T:\r\n");
+
+    printf("Virtual drive %c: installed\r\n", cfg.driveletter);
     printf("Ring buffer at %04X:%04X\r\n", seg, off);
-    printf("Run: SHOWBUF %04X:%04X\r\n", seg, off);
+    printf("Run: DUMPBUF %04X:%04X\r\n", seg, off);
     printf("Staying resident (%u paragraphs).\r\n", paras);
 
     {

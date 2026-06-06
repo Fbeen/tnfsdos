@@ -1,9 +1,9 @@
 /*
- * SHOWBUF.C  -  Dump a TSR ring buffer to D:\TNFS\DEBUG.TXT
- * Usage:  SHOWBUF SSSS:OOOO
- * Compile: wcc -bt=dos -ms -3 -d2 -s showbuf.c
+ * DUMPBUF.C  -  Dump a TSR ring buffer to D:\TNFS\DEBUG.TXT
+ * Usage:  DUMPBUF SSSS:OOOO
+ * Compile: wcc -bt=dos -ms -3 -d2 -s dumpbuf.c
  *
- * SHOWBUF disables TSR logging permanently for this DOS session.
+ * DUMPBUF disables TSR logging permanently for this DOS session.
  * Reboot/reload TSR to enable logging again.
  *
  * Order of operations:
@@ -20,7 +20,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* Must match tsr.c exactly */
+/* Must match main.c exactly */
 #define RING_MAGIC  0xBEEFu
 #define RING_SIZE   4096
 
@@ -57,7 +57,7 @@ int main(int argc, char *argv[])
     FILE         *f;
 
     if (argc < 2) {
-        puts("Usage: SHOWBUF SSSS:OOOO");
+        puts("Usage: DUMPBUF SSSS:OOOO");
         return 1;
     }
 

@@ -5,7 +5,7 @@
 
 #define VOLUME_LABEL  "TNFSDOS    "   /* 11-byte FCB-padded volume label */
 
-/* SDA pointer — written by init_cds (dosutil), read by all handlers. */
+/* SDA pointer — written by init_cds (main), read by all handlers. */
 extern char far *glob_sdaptr;
 
 /* INT 2Fh AH=11h handler functions (called from handler.asm) */

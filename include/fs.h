@@ -2,9 +2,17 @@
 #define FS_H
 
 #include <i86.h>
+#include "config.h"
 
-/* Drive index for T: (A=0 … T=19).  CONFIG.SYS must have LASTDRIVE>=T. */
-#define DRIVE_T_IDX  19
+/* ------------------------------------------------------------------ */
+/*  Runtime drive configuration                                         */
+/* ------------------------------------------------------------------ */
+
+/* Drive index used at runtime — set by fs_set_drive() before TSR install. */
+extern unsigned char g_drive_idx;
+
+/* Update the virtual drive letter; call once before going resident. */
+void fs_set_drive(char letter);
 
 /* ------------------------------------------------------------------ */
 /*  Opaque FS interface types                                           */
@@ -22,14 +30,14 @@ typedef struct {
 /*  Path tests                                                          */
 /* ------------------------------------------------------------------ */
 
-/* Returns 1 if path is the root "T:\" or "T:" */
+/* Returns 1 if path is the root "X:\" or "X:" for the configured drive. */
 int fs_is_root(const char far *path);
 
 /* ------------------------------------------------------------------ */
 /*  Node operations                                                     */
 /* ------------------------------------------------------------------ */
 
-/* Resolve "T:\[subdir\]name" → FsNode.  Returns 1 on success. */
+/* Resolve "X:\[subdir\]name" → FsNode.  Returns 1 on success. */
 int           fs_resolve  (const char far *path, FsNode *node);
 int           fs_is_dir   (const FsNode *node);
 unsigned char fs_get_attr (const FsNode *node);
@@ -56,7 +64,7 @@ void sft_fill_handle(const FsHandle *handle, char far *sft);
 
 /* Begin enumeration in path with FCB template tmpl.
  * Returns  1: directory found.
- * Returns  0: path not found / not on T:.
+ * Returns  0: path not found / not on the virtual drive.
  * Returns -1: path component is a file (DOS error 3). */
 int fs_enum_begin(const char far *path, const char far *tmpl, FsDirEnum *de);
 

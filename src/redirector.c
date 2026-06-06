@@ -107,7 +107,7 @@ unsigned int __cdecl do_findfirst(void)
             | ((unsigned int)(unsigned char)sda[0x0F] << 8);
     dta = (char far *)MK_FP(dta_seg, dta_off);
 
-    dta[0] = (char)(DRIVE_T_IDX | 0x80);
+    dta[0] = (char)(g_drive_idx | 0x80);
     for (k = 0; k < 11; k++) dta[1+k] = tmpl[k];
     dta[12] = (char)srch_attr;
     dta[13] = (char)de.next_idx;
