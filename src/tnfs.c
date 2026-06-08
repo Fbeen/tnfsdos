@@ -55,6 +55,20 @@ static const char *tnfs_err_name(uint8_t err)
     }
 }
 
+static const char *tnfs_cmd_name(uint8_t cmd)
+{
+    switch (cmd) {
+    case 0x00: return "MOUNT";
+    case 0x01: return "UMOUNT";
+    case 0x10: return "OPENDIR";
+    case 0x11: return "READDIR";
+    case 0x12: return "CLOSEDIR";
+    case 0x17: return "OPENDIRX";
+    case 0x18: return "READDIRX";
+    default:   return "?";
+    }
+}
+
 /* sends the allready buffered data to the server and waits for a response */
 int tnfs_sendReceive(int length)
 {
@@ -66,6 +80,12 @@ int tnfs_sendReceive(int length)
     uint8_t req_sid_hi = (uint8_t)tnfs_buffer[1];
     uint8_t req_seq    = (uint8_t)tnfs_buffer[2];
     uint8_t req_cmd    = (uint8_t)tnfs_buffer[3];
+
+    /* Open IP receive handle for this exchange; release immediately after. */
+    if (netw_open_rx() != 0) {
+        tnfs_buffer[4] = TNFS_EPROTO;
+        return -TNFS_EPROTO;
+    }
 #ifdef DEBUG
     int i = 0;
 #endif
@@ -76,16 +96,16 @@ int tnfs_sendReceive(int length)
 
         if (rbuf.enabled) {
             int pi, pn;
-            rb_write("TX#"); rb_dec((unsigned)retry);
-            rb_write(" sid=");
-            rb_hex8(req_sid_hi);
-            rb_hex8(req_sid_lo);
-            rb_write(" seq="); rb_hex8(req_seq);
+            rb_write("TNFS_TX seq="); rb_hex8(req_seq);
             rb_write(" cmd="); rb_hex8(req_cmd);
+            rb_write(" name="); rb_write(tnfs_cmd_name(req_cmd));
+            rb_write(" sid="); rb_hex8(req_sid_hi); rb_hex8(req_sid_lo);
             rb_write(" len="); rb_dec((unsigned)length);
-            rb_write(" pay=");
-            pn = (length < 16) ? length : 16;
-            for (pi = 0; pi < pn; pi++) {
+            if (retry > 0) { rb_write(" retry="); rb_dec((unsigned)retry); }
+            rb_write(" data=");
+            pn = (length - 4 < 32) ? length - 4 : 32;
+            if (pn < 0) pn = 0;
+            for (pi = 4; pi < 4 + pn; pi++) {
                 rb_hex8((unsigned char)tnfs_buffer[pi]);
                 rb_putc(' ');
             }
@@ -100,31 +120,24 @@ int tnfs_sendReceive(int length)
             rlength = netw_recv((uint8_t*)tnfs_buffer, TNFS_BUFFERSIZE);
         }
 
-        if (rbuf.enabled) {
-            if (rlength > 0) {
-                int pi, pn;
-                uint8_t rx_err = (uint8_t)tnfs_buffer[4];
-                rb_write("RX sid=");
-                rb_hex8((unsigned char)tnfs_buffer[1]);
-                rb_hex8((unsigned char)tnfs_buffer[0]);
-                rb_write(" seq="); rb_hex8((unsigned char)tnfs_buffer[2]);
-                rb_write(" cmd="); rb_hex8((unsigned char)tnfs_buffer[3]);
-                rb_write(" err="); rb_hex8(rx_err);
-                rb_putc('('); rb_write(tnfs_err_name(rx_err)); rb_putc(')');
-                rb_write(" len="); rb_dec((unsigned)rlength);
-                rb_write(" pay=");
-                pn = (rlength < 16) ? rlength : 16;
-                for (pi = 0; pi < pn; pi++) {
-                    rb_hex8((unsigned char)tnfs_buffer[pi]);
-                    rb_putc(' ');
-                }
-                rb_write("\r\n");
-            } else {
-                rb_write("RX FAIL rlength="); rb_dec((unsigned)(rlength < 0 ? (unsigned)(-rlength) : 0));
-                rb_write(" exp seq="); rb_hex8(req_seq);
-                rb_write(" cmd="); rb_hex8(req_cmd);
-                rb_write("\r\n");
+        if (rbuf.enabled && rlength > 0) {
+            int pi, pn;
+            uint8_t rx_err = (uint8_t)tnfs_buffer[4];
+            rb_write("TNFS_RX seq="); rb_hex8((uint8_t)tnfs_buffer[2]);
+            rb_write(" cmd="); rb_hex8((uint8_t)tnfs_buffer[3]);
+            rb_write(" err="); rb_hex8(rx_err);
+            rb_putc('('); rb_write(tnfs_err_name(rx_err)); rb_putc(')');
+            rb_write(" sid=");
+            rb_hex8((uint8_t)tnfs_buffer[1]); rb_hex8((uint8_t)tnfs_buffer[0]);
+            rb_write(" len="); rb_dec((unsigned)rlength);
+            rb_write(" data=");
+            pn = (rlength - 4 < 32) ? rlength - 4 : 32;
+            if (pn < 0) pn = 0;
+            for (pi = 4; pi < 4 + pn; pi++) {
+                rb_hex8((unsigned char)tnfs_buffer[pi]);
+                rb_putc(' ');
             }
+            rb_write("\r\n");
         }
 
         /* Detect stale/mismatched response: seq or cmd doesn't match request.
@@ -139,19 +152,34 @@ int tnfs_sendReceive(int length)
                 (uint8_t)tnfs_buffer[2] != req_seq ||
                 (uint8_t)tnfs_buffer[3] != req_cmd) {
                 if (rbuf.enabled) {
-                    rb_write("MISMATCH exp sid=");
-                    rb_hex8(req_sid_hi); rb_hex8(req_sid_lo);
-                    rb_write(" seq="); rb_hex8(req_seq);
-                    rb_write(" cmd="); rb_hex8(req_cmd);
-                    rb_write(" got sid=");
-                    rb_hex8((uint8_t)tnfs_buffer[1]);
-                    rb_hex8((uint8_t)tnfs_buffer[0]);
-                    rb_write(" seq="); rb_hex8((uint8_t)tnfs_buffer[2]);
-                    rb_write(" cmd="); rb_hex8((uint8_t)tnfs_buffer[3]);
-                    rb_write(" err="); rb_hex8((uint8_t)tnfs_buffer[4]);
-                    rb_write("\r\n");
+                    if (!sid_ok) {
+                        rb_write("TNFS_DROP reason=SID expected=");
+                        rb_hex8(req_sid_hi); rb_hex8(req_sid_lo);
+                        rb_write(" actual=");
+                        rb_hex8((uint8_t)tnfs_buffer[1]); rb_hex8((uint8_t)tnfs_buffer[0]);
+                        rb_write(" seq="); rb_hex8(req_seq);
+                        rb_write(" cmd="); rb_hex8(req_cmd);
+                        rb_write("\r\n");
+                    }
+                    if ((uint8_t)tnfs_buffer[2] != req_seq) {
+                        rb_write("TNFS_DROP reason=SEQ expected=");
+                        rb_hex8(req_seq);
+                        rb_write(" actual=");
+                        rb_hex8((uint8_t)tnfs_buffer[2]);
+                        rb_write(" cmd="); rb_hex8(req_cmd);
+                        rb_write("\r\n");
+                    }
+                    if ((uint8_t)tnfs_buffer[3] != req_cmd) {
+                        rb_write("TNFS_DROP reason=CMD expected=");
+                        rb_hex8(req_cmd);
+                        rb_write(" actual=");
+                        rb_hex8((uint8_t)tnfs_buffer[3]);
+                        rb_write(" seq="); rb_hex8(req_seq);
+                        rb_write("\r\n");
+                    }
                 }
                 tnfs_buffer[4] = TNFS_EPROTO;
+                netw_close_rx();
                 return -TNFS_EPROTO;
             }
         }
@@ -163,17 +191,18 @@ int tnfs_sendReceive(int length)
     /* no response after retries */
     if (rlength <= 0) {
         if (rbuf.enabled) {
-            rb_write("TNFS TO exp sid=");
-            rb_hex8(req_sid_hi); rb_hex8(req_sid_lo);
-            rb_write(" seq="); rb_hex8(req_seq);
+            rb_write("TNFS_TO seq="); rb_hex8(req_seq);
             rb_write(" cmd="); rb_hex8(req_cmd);
-            rb_write(" tries="); rb_dec((unsigned)retry);
+            rb_write(" name="); rb_write(tnfs_cmd_name(req_cmd));
+            rb_write(" sid="); rb_hex8(req_sid_hi); rb_hex8(req_sid_lo);
+            rb_write(" retry="); rb_dec((unsigned)retry);
             rb_write("\r\n");
         }
 #ifdef DEBUG
         printf("Server did not respond, transfer aborted!\n\n");
 #endif
-        tnfs_buffer[4] = TNFS_EPROTO;   /* mirror server behaviour */
+        tnfs_buffer[4] = TNFS_EPROTO;
+        netw_close_rx();
         return -TNFS_EPROTO;
     }
 
@@ -191,9 +220,11 @@ int tnfs_sendReceive(int length)
         printf("Server returned error code: %02X\n\n",
                (uint8_t)tnfs_buffer[4]);
 #endif
+        netw_close_rx();
         return -tnfs_buffer[4];
     }
 
+    netw_close_rx();
     return rlength;
 }
 
@@ -204,23 +235,12 @@ void tnfs_prepareCommand(uint8_t cmd)
     memcpy(&tnfs_buffer[0], &tnfs_session_id, 2);
     tnfs_buffer[2] = tnfs_request_id++;
     tnfs_buffer[3] = cmd;
-    if (rbuf.enabled) {
-        rb_write("CMD ");
-        rb_hex8(cmd);
-        rb_write(" sid=");
-        rb_hex8((uint8_t)(tnfs_session_id >> 8));
-        rb_hex8((uint8_t)tnfs_session_id);
-        rb_write(" seq=");
-        rb_hex8(tnfs_buffer[2]);
-        rb_write("\r\n");
-    }
 }
 
 /* Establish a new session */
 int tnfs_mount(const char* dir, const char* username, const char* password)
 {
     size_t length = 6;
-    uint16_t retry_time = 0;
 
     /* Save root path so tnfs_remount() can re-establish the session later */
     strncpy(s_tnfs_root, dir, TNFS_MAX_PATH_LEN - 1);
@@ -238,32 +258,29 @@ int tnfs_mount(const char* dir, const char* username, const char* password)
     strcpy(&tnfs_buffer[length], password);
     length += strlen(password) + 1;
 
+    if (rbuf.enabled) {
+        rb_write("TNFS_CALL MOUNT root=\""); rb_write(dir); rb_write("\"\r\n");
+    }
     length = tnfs_sendReceive((int)length);
     if (tnfs_buffer[4] == 0x00) {
         /* session id */
         memcpy(&tnfs_session_id, &tnfs_buffer[0], 2);
 
-        /* retry time (uint16 little endian) */
-        memcpy(&retry_time, &tnfs_buffer[7], 2);
-
         memcpy(&tnfs_min_retry_ms, &tnfs_buffer[7], 2);
         s_mounted = 1;
         if (rbuf.enabled) {
-            rb_write("MOUNTED sid=");
+            rb_write("TNFS_RET MOUNT sid=");
             rb_hex8((uint8_t)(tnfs_session_id >> 8));
             rb_hex8((uint8_t)tnfs_session_id);
             rb_write(" retry_ms=");
-            rb_hex8((uint8_t)(tnfs_min_retry_ms >> 8));
-            rb_hex8((uint8_t)tnfs_min_retry_ms);
+            rb_dec((unsigned)tnfs_min_retry_ms);
             rb_write("\r\n");
         }
-#ifdef DEBUG
-        printf("session id: %u\n", tnfs_session_id);
-        printf("server minimal retry time: %u\n\n", retry_time);
-#endif
     } else {
         if (rbuf.enabled) {
-            rb_write("MOUNT FAIL err="); rb_hex8(tnfs_buffer[4]); rb_write("\r\n");
+            rb_write("TNFS_RET MOUNT ERR err="); rb_hex8((uint8_t)tnfs_buffer[4]);
+            rb_putc('('); rb_write(tnfs_err_name((uint8_t)tnfs_buffer[4])); rb_putc(')');
+            rb_write("\r\n");
         }
     }
 
@@ -407,23 +424,44 @@ int tnfs_opendirx(char* path, char* pattern, uint8_t diropts, uint8_t sortopts, 
     int length = 8;
 
     tnfs_prepareCommand(0x17);
-    tnfs_buffer[4] = diropts;			// directory options
-    tnfs_buffer[5] = sortopts;			// sort options
-    // leave tnfs_buffer[6] and [7] to zero  because we want the total files found
+    tnfs_buffer[4] = diropts;
+    tnfs_buffer[5] = sortopts;
+    tnfs_buffer[6] = 0;   /* max results = 0: no limit */
+    tnfs_buffer[7] = 0;
     strcpy(&tnfs_buffer[length], pattern);		// search pattern
     length += strlen(pattern)+1;
     strcpy(&tnfs_buffer[length], path);		// directory path
     length += strlen(path)+1;
-    
-    length = tnfs_sendReceive(length);
-    
-    memset(data, 0, sizeof(struct dirx_data)); // set whole structure to zeros
-    if(length == 8 && tnfs_buffer[4] == 0x00) {
-    	data->handle = tnfs_buffer[5];
-    	memcpy(&data->entries, &tnfs_buffer[6], 2); // copy the number of matching directory entries found in odirx.entries.
+
+    if (rbuf.enabled) {
+        rb_write("XDIR opt="); rb_hex8(diropts);
+        rb_write(" sort="); rb_hex8(sortopts);
+        rb_write(" max="); rb_hex8(tnfs_buffer[6]); rb_hex8(tnfs_buffer[7]);
+        rb_write(" pat=\""); rb_write(pattern);
+        rb_write("\" path=\""); rb_write(path); rb_write("\"\r\n");
     }
-    
-    return tnfs_buffer[4] * -1; // Return code
+    length = tnfs_sendReceive(length);
+
+    memset(data, 0, sizeof(struct dirx_data));
+    if (length == 8 && tnfs_buffer[4] == 0x00) {
+        data->handle = tnfs_buffer[5];
+        memcpy(&data->entries, &tnfs_buffer[6], 2);
+        if (rbuf.enabled) {
+            rb_write("TNFS_RET OPENDIRX h="); rb_hex8(data->handle);
+            rb_write(" entries="); rb_dec((unsigned)data->entries);
+            rb_write("\r\n");
+        }
+    } else if (rbuf.enabled) {
+        rb_write("TNFS_RET OPENDIRX ");
+        if ((uint8_t)tnfs_buffer[4] == TNFS_EPROTO) rb_write("TIMEOUT");
+        else {
+            rb_write("ERR err="); rb_hex8((uint8_t)tnfs_buffer[4]);
+            rb_putc('('); rb_write(tnfs_err_name((uint8_t)tnfs_buffer[4])); rb_putc(')');
+        }
+        rb_write("\r\n");
+    }
+
+    return tnfs_buffer[4] * -1;
 }
 
 /* Closes a directory */
@@ -435,9 +473,18 @@ int tnfs_closedir(char handle)
     tnfs_prepareCommand(0x12);
     tnfs_buffer[4] = handle;
 
+    if (rbuf.enabled) {
+        rb_write("TNFS_CALL CLOSEDIR h="); rb_hex8((uint8_t)handle); rb_write("\r\n");
+    }
     rc = tnfs_sendReceive(length);
-    if (rbuf.enabled && rc <= 0) {
-        rb_write("CLOSEDIR FAIL rc="); rb_hex8((uint8_t)(-rc)); rb_write("\r\n");
+    if (rbuf.enabled) {
+        rb_write("TNFS_RET CLOSEDIR h="); rb_hex8((uint8_t)handle);
+        rb_write(" err="); rb_hex8((uint8_t)tnfs_buffer[4]);
+        rb_putc('(');
+        if ((uint8_t)tnfs_buffer[4] == TNFS_EPROTO) rb_write("TIMEOUT");
+        else rb_write(tnfs_err_name((uint8_t)tnfs_buffer[4]));
+        rb_putc(')');
+        rb_write("\r\n");
     }
     return tnfs_buffer[4] * -1;
 }
@@ -450,15 +497,32 @@ int tnfs_readdirx(struct dirx_data* data)
     tnfs_prepareCommand(0x18);
     tnfs_buffer[4] = data->handle;
     tnfs_buffer[5] = TNFS_MAX_RESULTS;
-    
-    length = tnfs_sendReceive(length);
-    
-    if(length > 8 && tnfs_buffer[4] == 0x00) {
-    	data->count  = tnfs_buffer[5];
-    	data->status = tnfs_buffer[6];
-    	memcpy(&data->dirpos, &tnfs_buffer[7], 2); // copy the position of first entry as given by TELLDIR
+
+    if (rbuf.enabled) {
+        rb_write("TNFS_CALL READDIRX h="); rb_hex8(data->handle); rb_write("\r\n");
     }
-    
+    length = tnfs_sendReceive(length);
+
+    if (length > 8 && tnfs_buffer[4] == 0x00) {
+        data->count  = tnfs_buffer[5];
+        data->status = tnfs_buffer[6];
+        memcpy(&data->dirpos, &tnfs_buffer[7], 2);
+        if (rbuf.enabled) {
+            rb_write("TNFS_RET READDIRX h="); rb_hex8(data->handle);
+            rb_write(" count="); rb_dec((unsigned)data->count);
+            rb_write(" status="); rb_hex8(data->status);
+            rb_write("\r\n");
+        }
+    } else if (rbuf.enabled) {
+        rb_write("TNFS_RET READDIRX h="); rb_hex8(data->handle);
+        rb_write(" err="); rb_hex8((uint8_t)tnfs_buffer[4]);
+        rb_putc('(');
+        if ((uint8_t)tnfs_buffer[4] == TNFS_EPROTO) rb_write("TIMEOUT");
+        else rb_write(tnfs_err_name((uint8_t)tnfs_buffer[4]));
+        rb_putc(')');
+        rb_write("\r\n");
+    }
+
     return tnfs_buffer[4] * -1;
 }
 
@@ -467,28 +531,39 @@ int tnfs_nextdirx(struct dirx_data* data, struct dirx_item* xitem)
 {
     int code;
     
-    if(data->entry >= data->count) {
-    	if(data->status == TNFS_DIRSTATUS_EOF) {
-    	    return TNFS_EOF;
-    	}
-	code = tnfs_readdirx(data);
-	if(code != 0) {
-	    return code * -1; // error
-	}
-    	data->needle = 9;
-    	data->entry = 0;
+    if (data->entry >= data->count) {
+        if (data->status == TNFS_DIRSTATUS_EOF) {
+            if (rbuf.enabled) {
+                rb_write("TNFS_RET READDIRX h="); rb_hex8(data->handle);
+                rb_write(" EOF\r\n");
+            }
+            return TNFS_EOF;
+        }
+        code = tnfs_readdirx(data);
+        if (code != 0) {
+            return code * -1;
+        }
+        data->needle = 9;
+        data->entry = 0;
     }
     /* fill dirx_item structure */
     xitem->flags = tnfs_buffer[data->needle];
-    memcpy(&xitem->size, &tnfs_buffer[data->needle + 1], 4); 
-    memcpy(&xitem->modified, &tnfs_buffer[data->needle + 5], 4); 
-    memcpy(&xitem->created, &tnfs_buffer[data->needle + 9], 4); 
+    memcpy(&xitem->size,     &tnfs_buffer[data->needle + 1],  4);
+    memcpy(&xitem->modified, &tnfs_buffer[data->needle + 5],  4);
+    memcpy(&xitem->created,  &tnfs_buffer[data->needle + 9],  4);
     xitem->name = &tnfs_buffer[data->needle + 13];
-    
+
+    if (rbuf.enabled) {
+        rb_write("TNFS_RET READDIRX h="); rb_hex8(data->handle);
+        rb_write(" name=\""); rb_write(xitem->name);
+        rb_write("\" flags="); rb_hex8(xitem->flags);
+        rb_write("\r\n");
+    }
+
     /* increase counters */
     data->needle += strlen(xitem->name) + 14;
     data->entry++;
-    
+
     return 0;
 }
 
@@ -516,10 +591,13 @@ int tnfs_seekdir(char handle, uint32_t position)
 
     tnfs_prepareCommand(0x16);
     tnfs_buffer[4] = handle;
-    memcpy(&tnfs_buffer[5], &position, 4);
-    
+    tnfs_buffer[5] = (uint8_t)(position);
+    tnfs_buffer[6] = (uint8_t)(position >> 8);
+    tnfs_buffer[7] = (uint8_t)(position >> 16);
+    tnfs_buffer[8] = (uint8_t)(position >> 24);
+
     tnfs_sendReceive(length);
-    
+
     return tnfs_buffer[4];
 }
 
@@ -557,8 +635,10 @@ int tnfs_open(char* filename, uint16_t flags, uint16_t mode)
     int length = 8;
 
     tnfs_prepareCommand(0x29);
-    memcpy(&tnfs_buffer[4], &flags, 2);
-    memcpy(&tnfs_buffer[6], &mode, 2);
+    tnfs_buffer[4] = (uint8_t)flags;
+    tnfs_buffer[5] = (uint8_t)(flags >> 8);
+    tnfs_buffer[6] = (uint8_t)mode;
+    tnfs_buffer[7] = (uint8_t)(mode >> 8);
     strcpy(&tnfs_buffer[length], filename);
     length += strlen(filename)+1;
 
@@ -576,15 +656,16 @@ int tnfs_read(char* data, uint8_t handle, uint16_t maxlen)
 
     tnfs_prepareCommand(0x21);
     tnfs_buffer[4] = handle;
-    memcpy(&tnfs_buffer[5], &maxlen, 2);
+    tnfs_buffer[5] = (uint8_t)maxlen;
+    tnfs_buffer[6] = (uint8_t)(maxlen >> 8);
 
     length = tnfs_sendReceive(length);
-    
+
     if(tnfs_buffer[4] != 0x00) {
-        return tnfs_buffer[4] * -1; // return code
+        return tnfs_buffer[4] * -1;
     }
-    
-    memcpy(&maxlen, &tnfs_buffer[5], 2);
+
+    maxlen = (uint16_t)tnfs_buffer[5] | ((uint16_t)tnfs_buffer[6] << 8);
     memcpy(data, &tnfs_buffer[7], maxlen);
     
     return maxlen; // actual length of data
@@ -597,7 +678,8 @@ int tnfs_write(char* data, uint8_t handle, uint16_t maxlen)
 
     tnfs_prepareCommand(0x22);
     tnfs_buffer[4] = handle;
-    memcpy(&tnfs_buffer[5], &maxlen, 2);
+    tnfs_buffer[5] = (uint8_t)maxlen;
+    tnfs_buffer[6] = (uint8_t)(maxlen >> 8);
     memcpy(&tnfs_buffer[7], data, maxlen);
     length += maxlen;
 
@@ -651,7 +733,10 @@ int tnfs_lseek(uint8_t handle, uint8_t seektype, uint32_t position)
     tnfs_prepareCommand(0x25);
     tnfs_buffer[4] = handle;
     tnfs_buffer[5] = seektype;
-    memcpy(&tnfs_buffer[6], &position, 4);
+    tnfs_buffer[6] = (uint8_t)(position);
+    tnfs_buffer[7] = (uint8_t)(position >> 8);
+    tnfs_buffer[8] = (uint8_t)(position >> 16);
+    tnfs_buffer[9] = (uint8_t)(position >> 24);
 
     tnfs_sendReceive(length);
    
@@ -678,7 +763,8 @@ int tnfs_chmod(uint16_t mode, char* filename)
     int length = 6;
 
     tnfs_prepareCommand(0x27);
-    memcpy(&tnfs_buffer[4], &mode, 2);
+    tnfs_buffer[4] = (uint8_t)mode;
+    tnfs_buffer[5] = (uint8_t)(mode >> 8);
     strcpy(&tnfs_buffer[length], filename);
     length += strlen(filename)+1;
 

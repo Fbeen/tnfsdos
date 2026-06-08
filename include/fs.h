@@ -2,6 +2,7 @@
 #define FS_H
 
 #include <i86.h>
+#include <stdint.h>
 #include "config.h"
 
 /* ------------------------------------------------------------------ */
@@ -19,7 +20,7 @@ void fs_set_drive(char letter);
 /* ------------------------------------------------------------------ */
 
 typedef struct { int dir_ctx; int idx; } FsNode;
-typedef struct { int dir_ctx; int idx; } FsHandle;
+typedef struct { int dir_ctx; int idx; uint8_t tnfs_fd; } FsHandle;
 typedef struct {
     int  dir_ctx;
     int  next_idx;
@@ -51,12 +52,13 @@ void fs_fill_found(const FsNode *node, char far *found);
 /*  File I/O                                                            */
 /* ------------------------------------------------------------------ */
 
-void         fs_open(const FsNode *node, FsHandle *handle);
-unsigned int fs_read(const FsHandle *handle, unsigned long pos,
-                     char far *buf, unsigned int n);
+void         fs_open (const FsNode *node, FsHandle *handle);
+unsigned int fs_read (const FsHandle *handle, unsigned long pos,
+                      char far *buf, unsigned int n);
+void         fs_close(const FsHandle *handle);
 
 /* Fill a DOS SFT for a network file described by an FsHandle. */
-void sft_fill_handle(const FsHandle *handle, char far *sft);
+void sft_fill_handle(const FsHandle *handle, const FsNode *node, char far *sft);
 
 /* ------------------------------------------------------------------ */
 /*  Directory enumeration                                               */

@@ -1,8 +1,12 @@
 /*
- * FS_TNFSMIN.C — Minimal live TNFS backend for TNFSDRV.
+ * FS_TNFSMIN.C — Atomic-load TNFS backend for TNFSDRV.
  *
- * Uses tnfs_opendirx / tnfs_nextdirx / tnfs_closedir (cmd 0x17/0x18).
- * Supports root directory enumeration only — no subdirs, no file I/O.
+ * Directory loading is atomic: OPENDIRX → READDIRX* → CLOSEDIR, all before
+ * returning from load_dir_cache().  No TNFS handle is ever left open after
+ * load_dir_cache() returns.  FindFirst/FindNext work entirely from cache.
+ *
+ * FsNode.dir_ctx / FsDirEnum.dir_ctx: always 0 (single cache).
+ * FsNode.idx: index into s_active_entries[].
  */
 
 #include <i86.h>
@@ -53,7 +57,7 @@ static void log_stack_state(void)
 #endif
 
 /* ------------------------------------------------------------------ */
-/*  Directory cache — loaded once at first FINDFIRST, then reused      */
+/*  Single active directory cache                                       */
 /* ------------------------------------------------------------------ */
 
 #define DIR_CACHE_MAX  32
@@ -61,11 +65,13 @@ static void log_stack_state(void)
 typedef struct {
     char          name[13];  /* 8.3 + NUL, uppercased */
     unsigned char attr;
+    unsigned long size;
 } DirEntry;
 
-static DirEntry s_dir[DIR_CACHE_MAX];
-static int      s_dir_count;
-static int      s_cache_valid;
+static char     s_active_path[128];           /* TNFS path, e.g. "/" or "/APAC" */
+static uint8_t  s_active_valid;
+static DirEntry s_active_entries[DIR_CACHE_MAX];
+static int      s_active_count;
 
 /* ------------------------------------------------------------------ */
 /*  Path helpers                                                        */
@@ -97,18 +103,125 @@ static int fn1_has_prefix(const char far *fn1)
     return 1;
 }
 
-/* Returns 1 if fn1 is root-level (no backslash after the "X:\" prefix).
- * "N:\*.TXT" and "N:\????????.???" are root-level.
- * "N:\SUBDIR\" and "N:\SUBDIR\FILE.TXT" are not.
- * Prevents unnecessary tnfs_opendir calls for subdirectory paths we don't support. */
+/* Returns 1 if fn1 has no backslash after the "X:\" prefix. */
 static int fn1_is_root_level(const char far *fn1)
 {
     int i;
-    for (i = 0; s_drv_prefix[i]; i++) ; /* skip "N:\" prefix (3 chars) */
+    for (i = 0; s_drv_prefix[i]; i++) ;
     for (; fn1[i]; i++) {
         if (fn1[i] == '\\') return 0;
     }
     return 1;
+}
+
+/* Parse a DOS FindFirst path into a clean TNFS dir path and template string.
+ * The last component becomes the template if it contains '?' or '*';
+ * otherwise it is part of the directory path (no-wildcard CHDIR case).
+ *   "N:\????????.???"       → dir="/",        tmpl="????????.???"
+ *   "N:\APAC\????????"      → dir="/APAC",     tmpl="????????"
+ *   "N:\APAC\SRC\*.TXT"     → dir="/APAC/SRC", tmpl="*.TXT"
+ *   "N:\APAC"               → dir="/APAC",     tmpl=""
+ * out_dir: 128 bytes, out_tmpl: 14 bytes. */
+static void dos_find_path_to_tnfs_dir_and_template(
+    const char far *raw,
+    char *out_dir,
+    char *out_tmpl)
+{
+    int i, j, last_bs, has_wc, start;
+    char c;
+
+    for (i = 0; s_drv_prefix[i]; i++) ; /* skip "N:\" prefix */
+
+    last_bs = -1;
+    for (j = i; raw[j]; j++)
+        if (raw[j] == '\\') last_bs = j;
+
+    start = (last_bs >= 0) ? last_bs + 1 : i;
+    has_wc = 0;
+    for (j = start; raw[j]; j++)
+        if (raw[j] == '?' || raw[j] == '*') { has_wc = 1; break; }
+
+    if (has_wc) {
+        /* template = last component, dir = path up to last_bs */
+        for (j = 0; raw[start + j] && j < 13; j++)
+            out_tmpl[j] = raw[start + j];
+        out_tmpl[j] = '\0';
+
+        if (last_bs < 0) {
+            out_dir[0] = '/'; out_dir[1] = '\0';
+        } else {
+            out_dir[0] = '/';
+            for (j = 0; (i + j) < last_bs && j < 126; j++) {
+                c = raw[i + j];
+                if (c == '\\') c = '/';
+                if (c >= 'a' && c <= 'z') c -= 32;
+                out_dir[1 + j] = c;
+            }
+            out_dir[1 + j] = '\0';
+        }
+    } else {
+        /* no wildcard: entire path (after prefix) is the directory */
+        out_tmpl[0] = '\0';
+        if (!raw[i]) {
+            out_dir[0] = '/'; out_dir[1] = '\0';
+        } else {
+            out_dir[0] = '/';
+            for (j = 0; raw[i + j] && j < 126; j++) {
+                c = raw[i + j];
+                if (c == '\\') c = '/';
+                if (c >= 'a' && c <= 'z') c -= 32;
+                out_dir[1 + j] = c;
+            }
+            out_dir[1 + j] = '\0';
+        }
+    }
+}
+
+/* Split fn1 into TNFS dir path + entry name (both into out buffers).
+ *   "N:\APAC"          → dir="/",     entry="APAC"
+ *   "N:\APAC\FILE.TXT" → dir="/APAC", entry="FILE.TXT"
+ * dir_out: 128 bytes, entry_out: 13 bytes. Returns 1 on success. */
+static int fn1_split(const char far *fn1, char *dir_out, char *entry_out)
+{
+    int i, j, last_bs;
+    char c;
+
+    if (!fn1_has_prefix(fn1)) return 0;
+    for (i = 0; s_drv_prefix[i]; i++) ;
+
+    last_bs = -1;
+    for (j = i; fn1[j]; j++) {
+        if (fn1[j] == '\\') last_bs = j;
+    }
+
+    if (last_bs < 0) {
+        /* "N:\APAC" — entry is directly under root */
+        dir_out[0] = '/'; dir_out[1] = '\0';
+        for (j = 0; fn1[i + j] && j < 12; j++) {
+            c = fn1[i + j];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            entry_out[j] = c;
+        }
+        entry_out[j] = '\0';
+    } else {
+        /* "N:\APAC\FILE.TXT" */
+        dir_out[0] = '/';
+        for (j = 0; (i + j) < last_bs && j < 126; j++) {
+            c = fn1[i + j];
+            if (c == '\\') c = '/';
+            if (c >= 'a' && c <= 'z') c -= 32;
+            dir_out[1 + j] = c;
+        }
+        dir_out[1 + j] = '\0';
+        for (j = 0; fn1[last_bs + 1 + j] && j < 12; j++) {
+            c = fn1[last_bs + 1 + j];
+            if (c >= 'a' && c <= 'z') c -= 32;
+            entry_out[j] = c;
+        }
+        entry_out[j] = '\0';
+    }
+
+    return (entry_out[0] != '\0') ? 1 : 0;
 }
 
 int fs_is_root(const char far *path)
@@ -164,67 +277,83 @@ static int tmpl_matches(const char *tmpl, const char *fcb)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Root directory loader                                               */
+/*  Single-active-directory cache loader                                */
 /* ------------------------------------------------------------------ */
 
-static int load_root_min(void)
+static int load_dir_cache(const char *path)
 {
     static struct dirx_data data;
     static struct dirx_item xitem;
+    uint8_t handle;
     int rc, i;
     char c;
 
-    s_dir_count = 0;
+    if (rbuf.enabled) { rb_write("DC_REQ path=\""); rb_write(path); rb_write("\"\r\n"); }
 
-    rc = tnfs_opendirx("/", "*.*", 0, 0, &data);
-    if (rc < 0) {
-        if (rbuf.enabled) {
-            rb_write("MIN FAIL ");
-            rb_write(rc == -(int)TNFS_EPROTO ? "TIMEOUT" : "ERR");
-            rb_write("\r\n");
-        }
-        return 0;
+    /* Cache hit — same directory already loaded, no TNFS needed */
+    if (s_active_valid && strcmp(s_active_path, path) == 0) {
+        if (rbuf.enabled) { rb_write("DC_HIT path=\""); rb_write(path); rb_write("\"\r\n"); }
+        return 1;
     }
 
-    for (;;) {
-        if (s_dir_count >= DIR_CACHE_MAX) break;
+    /* Invalidate before loading; will only become valid after CLOSEDIR OK */
+    s_active_valid = 0;
+    s_active_count = 0;
 
+    if (rbuf.enabled) { rb_write("DC_LOAD path=\""); rb_write(path); rb_write("\"\r\n"); }
+
+    rc = tnfs_opendirx((char *)path, "*.*", 0, 1, &data);
+    if (rc < 0) {
+        if (rbuf.enabled) { rb_write("DC_FAIL path=\""); rb_write(path); rb_write("\"\r\n"); }
+        return 0;
+    }
+    handle = data.handle;
+    if (rbuf.enabled) { rb_write("XDIR open h="); rb_hex8(handle); rb_write("\r\n"); }
+
+    rc = 0;
+    for (;;) {
+        if (s_active_count >= DIR_CACHE_MAX) break;
         rc = tnfs_nextdirx(&data, &xitem);
-        if (rc != 0) break;   /* TNFS_EOF or network error */
+        if (rc != 0) break;
 
         if (is_dot_entry(xitem.name)) continue;
+        if (!is_8dot3(xitem.name)) continue;
 
-        if (!is_8dot3(xitem.name)) {
-            if (rbuf.enabled) {
-                rb_write("MIN skip \""); rb_write(xitem.name); rb_write("\"\r\n");
-            }
-            continue;
-        }
-
-        /* Uppercase the name into the cache slot */
         for (i = 0; xitem.name[i] && i < 12; i++) {
             c = xitem.name[i];
             if (c >= 'a' && c <= 'z') c -= 32;
-            s_dir[s_dir_count].name[i] = c;
+            s_active_entries[s_active_count].name[i] = c;
         }
-        s_dir[s_dir_count].name[i] = '\0';
-        s_dir[s_dir_count].attr = (xitem.flags & TNFS_DIRENTRY_DIR) ? 0x10 : 0x20;
-
+        s_active_entries[s_active_count].name[i] = '\0';
+        s_active_entries[s_active_count].attr = (xitem.flags & TNFS_DIRENTRY_DIR) ? 0x10 : 0x20;
+        s_active_entries[s_active_count].size = (unsigned long)xitem.size;
         if (rbuf.enabled) {
-            rb_write("MIN+ \""); rb_write(s_dir[s_dir_count].name); rb_write("\"\r\n");
+            rb_write("XDIR entry \""); rb_write(s_active_entries[s_active_count].name);
+            rb_write("\"\r\n");
         }
-        s_dir_count++;
+        s_active_count++;
     }
 
-    if (rbuf.enabled && rc != 0 && rc != TNFS_EOF) {
-        rb_write("MIN ERR rc="); rb_hex8((unsigned char)rc); rb_write("\r\n");
+    if (rc != 0 && rc != (int)TNFS_EOF) {
+        if (rbuf.enabled) { rb_write("DC_FAIL path=\""); rb_write(path); rb_write("\" reason=READ\r\n"); }
+        tnfs_closedir(handle);   /* best-effort close; result ignored */
+        return 0;
     }
 
-    tnfs_closedir(data.handle);
+    if (rbuf.enabled) { rb_write("XDIR EOF\r\n"); }
 
-    if (rbuf.enabled) {
-        rb_write("MIN n="); rb_dec((unsigned)s_dir_count); rb_write("\r\n");
+    /* Atomic close — must succeed before cache becomes valid */
+    if (rbuf.enabled) { rb_write("XDIR close h="); rb_hex8(handle); rb_write("\r\n"); }
+    rc = tnfs_closedir(handle);
+    if (rc != 0) {
+        if (rbuf.enabled) { rb_write("XDIR close TIMEOUT after EOF\r\n"); }
+        return 0;
     }
+    if (rbuf.enabled) { rb_write("XDIR close OK\r\n"); }
+
+    strcpy(s_active_path, path);
+    s_active_valid = 1;
+    if (rbuf.enabled) { rb_write("DC_READY path=\""); rb_write(path); rb_write("\" n="); rb_dec((unsigned)s_active_count); rb_write("\r\n"); }
     return 1;
 }
 
@@ -234,67 +363,160 @@ static int load_root_min(void)
 
 int fs_resolve(const char far *path, FsNode *node)
 {
-    /* Not implemented: TNFSMIN root-only, no GETATTR/OPEN for individual files */
-    (void)path; (void)node;
+    static char dir_path[128]; /* static = DS-relative, safe under -zu */
+    static char entry[13];
+    int i;
+
+    if (!fn1_split(path, dir_path, entry)) return 0;
+
+    if (rbuf.enabled) { rb_write("RES \""); rb_write(entry); rb_write("\" in \""); rb_write(dir_path); rb_write("\"\r\n"); }
+
+    if (!load_dir_cache(dir_path)) return 0;
+
+    for (i = 0; i < s_active_count; i++) {
+        if (strcmp(entry, s_active_entries[i].name) == 0) {
+            node->dir_ctx = 0;
+            node->idx     = i;
+            return 1;
+        }
+    }
+
+    if (rbuf.enabled) rb_write("RES miss\r\n");
     return 0;
 }
 
-int           fs_is_dir  (const FsNode *node) { (void)node; return 0; }
-unsigned char fs_get_attr(const FsNode *node) { (void)node; return 0x20; }
-unsigned long fs_get_size(const FsNode *node) { (void)node; return 0; }
+int fs_is_dir(const FsNode *node)
+{
+    if (node->idx < 0 || node->idx >= s_active_count) return 0;
+    return (s_active_entries[node->idx].attr & 0x10) ? 1 : 0;
+}
+
+unsigned char fs_get_attr(const FsNode *node)
+{
+    if (node->idx < 0 || node->idx >= s_active_count) return 0x20;
+    return s_active_entries[node->idx].attr;
+}
+
+unsigned long fs_get_size(const FsNode *node)
+{
+    if (node->idx < 0 || node->idx >= s_active_count) return 0;
+    return s_active_entries[node->idx].size;
+}
 
 const char *fs_get_name(const FsNode *node)
 {
-    if (node->idx >= 0 && node->idx < s_dir_count)
-        return s_dir[node->idx].name;
+    if (node->idx >= 0 && node->idx < s_active_count)
+        return s_active_entries[node->idx].name;
     return "";
 }
 
 void fs_fill_found(const FsNode *node, char far *found)
 {
     static char fcb[11];
-    const DirEntry *e;
+    unsigned long sz;
     int k;
-    if (node->idx < 0 || node->idx >= s_dir_count) return;
-    e = &s_dir[node->idx];
-    entry_to_fcb(e->name, fcb);
+    if (node->idx < 0 || node->idx >= s_active_count) return;
+    entry_to_fcb(s_active_entries[node->idx].name, fcb);
     for (k = 0;  k < 11; k++) found[k] = fcb[k];
-    found[11] = e->attr;
-    for (k = 12; k < 32; k++) found[k] = 0;
+    found[11] = s_active_entries[node->idx].attr;
+    for (k = 12; k < 28; k++) found[k] = 0;
+    sz = s_active_entries[node->idx].size;
+    found[28] = (char)(sz);
+    found[29] = (char)(sz >> 8);
+    found[30] = (char)(sz >> 16);
+    found[31] = (char)(sz >> 24);
 }
+
+static char s_read_buf[512]; /* intermediate buffer: tnfs_read (near) → far DTA copy */
 
 void fs_open(const FsNode *node, FsHandle *handle)
 {
+    static char tnfs_path[128];
+    const char *name;
+    int i, rc;
+
     handle->dir_ctx = node->dir_ctx;
     handle->idx     = node->idx;
+    handle->tnfs_fd = 0xFF;
+
+    name = s_active_entries[node->idx].name;
+
+    /* Build TNFS path: s_active_path + "/" + name, avoiding double slash at root */
+    i = 0;
+    if (s_active_path[0] == '/' && s_active_path[1] == '\0') {
+        tnfs_path[i++] = '/';
+    } else {
+        int j = 0;
+        while (s_active_path[j] && i < 120) tnfs_path[i++] = s_active_path[j++];
+        tnfs_path[i++] = '/';
+    }
+    while (*name && i < 126) tnfs_path[i++] = *name++;
+    tnfs_path[i] = '\0';
+
+    if (rbuf.enabled) { rb_write("FS_OPEN "); rb_write(tnfs_path); rb_write("\r\n"); }
+
+    rc = tnfs_open(tnfs_path, 0x0001, 0); /* O_RDONLY */
+    if (rc < 0) {
+        if (rbuf.enabled) { rb_write("FS_OPEN FAIL\r\n"); }
+        return;
+    }
+    handle->tnfs_fd = (uint8_t)rc;
+    if (rbuf.enabled) { rb_write("FS_OPEN fd="); rb_hex8(handle->tnfs_fd); rb_write("\r\n"); }
 }
 
 unsigned int fs_read(const FsHandle *handle, unsigned long pos,
                      char far *buf, unsigned int n)
 {
-    /* No file I/O in TNFSMIN */
-    (void)handle; (void)pos; (void)buf; (void)n;
-    return 0;
+    int got;
+    unsigned int i;
+
+    if (handle->tnfs_fd == 0xFF) return 0;
+    if (n > sizeof(s_read_buf)) n = (unsigned int)sizeof(s_read_buf);
+
+    tnfs_lseek(handle->tnfs_fd, 0, (uint32_t)pos); /* SEEK_SET = 0 */
+
+    got = tnfs_read(s_read_buf, handle->tnfs_fd, (uint16_t)n);
+    if (got <= 0) return 0;
+
+    for (i = 0; i < (unsigned int)got; i++) buf[i] = s_read_buf[i];
+    return (unsigned int)got;
 }
 
-void sft_fill_handle(const FsHandle *handle, char far *sft)
+void fs_close(const FsHandle *handle)
+{
+    if (handle->tnfs_fd == 0xFF) return;
+    if (rbuf.enabled) { rb_write("FS_CLOSE fd="); rb_hex8(handle->tnfs_fd); rb_write("\r\n"); }
+    tnfs_close(handle->tnfs_fd);
+}
+
+void sft_fill_handle(const FsHandle *handle, const FsNode *node, char far *sft)
 {
     static char fcb[11];
-    const DirEntry *e;
+    unsigned long sz;
     int k;
-    if (handle->idx < 0 || handle->idx >= s_dir_count) return;
-    e = &s_dir[handle->idx];
-    entry_to_fcb(e->name, fcb);
-    sft[0x04] = e->attr;
+    if (node->idx < 0 || node->idx >= s_active_count) return;
+    entry_to_fcb(s_active_entries[node->idx].name, fcb);
+    sft[0x04] = s_active_entries[node->idx].attr;
     sft[0x05] = (char)g_drive_idx;
     sft[0x06] = 0x80;
-    for (k = 0x07; k <= 0x2A; k++) sft[k] = 0;
+    sft[0x07] = (char)handle->tnfs_fd;  /* TNFS file handle for read/close */
+    for (k = 0x08; k <= 0x10; k++) sft[k] = 0;
+    sz = s_active_entries[node->idx].size;
+    sft[0x11] = (char)(sz);
+    sft[0x12] = (char)(sz >> 8);
+    sft[0x13] = (char)(sz >> 16);
+    sft[0x14] = (char)(sz >> 24);
+    for (k = 0x15; k <= 0x1F; k++) sft[k] = 0;
     for (k = 0;    k < 11;   k++) sft[0x20+k] = fcb[k];
+    for (k = 0x2B; k <= 0x35; k++) sft[k] = 0;
 }
 
 int fs_enum_begin(const char far *path, const char far *tmpl, FsDirEnum *de)
 {
+    static char enum_path[128]; /* static = DS-relative, safe under -zu */
+    static char enum_tmpl[14];  /* static = DS-relative, safe under -zu */
     int k;
+
     for (k = 0; k < 11; k++) de->tmpl[k] = (char)tmpl[k];
     de->next_idx = 0;
     de->dir_ctx  = 0;
@@ -303,24 +525,29 @@ int fs_enum_begin(const char far *path, const char far *tmpl, FsDirEnum *de)
 
     if (!fn1_has_prefix(path)) return 0;
 
-    if (!fn1_is_root_level(path)) {
-        if (rbuf.enabled) rb_write("EB: subdir\r\n");
-        return 0;
+    dos_find_path_to_tnfs_dir_and_template(path, enum_path, enum_tmpl);
+
+    if (rbuf.enabled) {
+        int k;
+        rb_write("FF raw=\"");
+        for (k = 0; path[k] && k < 40; k++) rb_putc(path[k]);
+        rb_write("\"\r\n");
+        rb_write("FF dir=\""); rb_write(enum_path); rb_write("\"\r\n");
+        rb_write("FF tmpl=\""); rb_write(enum_tmpl); rb_write("\"\r\n");
     }
 
-    if (!s_cache_valid) {
-        if (!load_root_min()) return 0;
-        s_cache_valid = 1;
-    }
+    if (!load_dir_cache(enum_path)) return 0;
+
     return 1;
 }
 
 int fs_enum_next(FsDirEnum *de, FsNode *node)
 {
     static char fcb[11];
-    while (de->next_idx < s_dir_count) {
+
+    while (de->next_idx < s_active_count) {
         int i = de->next_idx++;
-        entry_to_fcb(s_dir[i].name, fcb);
+        entry_to_fcb(s_active_entries[i].name, fcb);
         if (!tmpl_matches(de->tmpl, fcb)) continue;
         node->dir_ctx = 0;
         node->idx     = i;

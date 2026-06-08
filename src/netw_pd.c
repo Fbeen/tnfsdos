@@ -229,16 +229,12 @@ static int pd_access_type(uint16_t ethertype, const uint8_t *type_buf)
     int86x((int)s_pd_int, &r, &r, &sr);
 
     handle = r.x.cflag ? -1 : (int)(unsigned)r.x.ax;
-    if (r.x.cflag)
-        printf("AT: INT=%02Xh ET=%04X DS:SI=%04X:%04X ES:DI=%04X:%04X CF=1 AX=%04X DX=%04X h=-1\r\n",
-               (unsigned)s_pd_int, (unsigned)ethertype,
-               ds_val, si_val, cb_seg, cb_off,
-               (unsigned)r.x.ax, (unsigned)r.x.dx);
-    else
-        printf("AT: INT=%02Xh ET=%04X DS:SI=%04X:%04X ES:DI=%04X:%04X CF=0 AX=%04X h=%d\r\n",
-               (unsigned)s_pd_int, (unsigned)ethertype,
-               ds_val, si_val, cb_seg, cb_off,
-               (unsigned)r.x.ax, handle);
+    if (r.x.cflag) {
+        printf("PD: access_type ET=%04X FAIL AX=%04X\r\n",
+               (unsigned)ethertype, (unsigned)r.x.ax);
+    } else {
+        printf("PD: access_type ET=%04X h=%d\r\n", (unsigned)ethertype, handle);
+    }
     return handle;
 }
 
@@ -284,6 +280,32 @@ static int pd_get_address(int handle)
 /* ------------------------------------------------------------------ */
 /* ARP resolution                                                        */
 /* ------------------------------------------------------------------ */
+
+/* Gratuitous ARP: announce our IP/MAC to refresh the server's ARP cache.
+ * The server's entry for our IP expires after ~30s idle; without this it
+ * cannot resolve our MAC to send the TNFS reply, causing silent timeouts.
+ * Sent before every TNFS exchange via netw_open_rx(). */
+static void arp_announce(void)
+{
+    static uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+
+    memset(s_tx_buf, 0, ARP_FRAME_LEN);
+    memcpy(s_tx_buf + OFF_ETH_DST,  bcast,       6);
+    memcpy(s_tx_buf + OFF_ETH_SRC,  s_local_mac, 6);
+    s_tx_buf[OFF_ETH_TYPE]     = 0x08;
+    s_tx_buf[OFF_ETH_TYPE + 1] = 0x06;
+    put16be(s_tx_buf + OFF_ARP_HTYPE, 0x0001u);
+    put16be(s_tx_buf + OFF_ARP_PTYPE, 0x0800u);
+    s_tx_buf[OFF_ARP_HLEN] = 6;
+    s_tx_buf[OFF_ARP_PLEN] = 4;
+    put16be(s_tx_buf + OFF_ARP_OPER,  0x0001u);  /* request */
+    memcpy(s_tx_buf + OFF_ARP_SHA, s_local_mac, 6);
+    memcpy(s_tx_buf + OFF_ARP_SPA, s_local_ip,  4);
+    memcpy(s_tx_buf + OFF_ARP_THA, bcast,       6);
+    memcpy(s_tx_buf + OFF_ARP_TPA, s_local_ip,  4); /* target IP = our IP */
+    pd_send_pkt(s_tx_buf, ARP_FRAME_LEN);
+    if (rbuf.enabled) rb_write("ARP ann\r\n");
+}
 
 static void build_arp_request(void)
 {
@@ -340,36 +362,6 @@ static int arp_resolve(void)
             /* Skip: buffer free (0) or handed to driver but not yet delivered (0xFFFF). */
             if (s_rx_len == 0 || s_rx_len == 0xFFFFu) continue;
 
-            /* Frame dump — before any filtering */
-            {
-                unsigned int i, n;
-                printf("RX: len=%u ET=%02X%02X\r\n",
-                       (unsigned)s_rx_len,
-                       (unsigned)s_rx_buf[12], (unsigned)s_rx_buf[13]);
-                n = ((unsigned)s_rx_len < 32u) ? (unsigned)s_rx_len : 32u;
-                for (i = 0; i < n; i++)
-                    printf("%02X%c", (unsigned)s_rx_buf[i],
-                           ((i & 15u) == 15u) ? '\n' : ' ');
-                printf("\r\n");
-                if (s_rx_buf[12] == 0x08 && s_rx_buf[13] == 0x06) {
-                    printf("ARP op=%04X"
-                           " SHA=%02X:%02X:%02X:%02X:%02X:%02X SPA=%u.%u.%u.%u"
-                           " THA=%02X:%02X:%02X:%02X:%02X:%02X TPA=%u.%u.%u.%u\r\n",
-                           (unsigned)get16be(s_rx_buf + OFF_ARP_OPER),
-                           (unsigned)s_rx_buf[OFF_ARP_SHA+0], (unsigned)s_rx_buf[OFF_ARP_SHA+1],
-                           (unsigned)s_rx_buf[OFF_ARP_SHA+2], (unsigned)s_rx_buf[OFF_ARP_SHA+3],
-                           (unsigned)s_rx_buf[OFF_ARP_SHA+4], (unsigned)s_rx_buf[OFF_ARP_SHA+5],
-                           (unsigned)s_rx_buf[OFF_ARP_SPA+0], (unsigned)s_rx_buf[OFF_ARP_SPA+1],
-                           (unsigned)s_rx_buf[OFF_ARP_SPA+2], (unsigned)s_rx_buf[OFF_ARP_SPA+3],
-                           (unsigned)s_rx_buf[OFF_ARP_THA+0], (unsigned)s_rx_buf[OFF_ARP_THA+1],
-                           (unsigned)s_rx_buf[OFF_ARP_THA+2], (unsigned)s_rx_buf[OFF_ARP_THA+3],
-                           (unsigned)s_rx_buf[OFF_ARP_THA+4], (unsigned)s_rx_buf[OFF_ARP_THA+5],
-                           (unsigned)s_rx_buf[OFF_ARP_TPA+0], (unsigned)s_rx_buf[OFF_ARP_TPA+1],
-                           (unsigned)s_rx_buf[OFF_ARP_TPA+2], (unsigned)s_rx_buf[OFF_ARP_TPA+3]);
-                }
-                fflush(stdout);
-            }
-
             /* Validate: ARP reply (opcode=2) from server IP */
             if (s_rx_len >= (uint16_t)ARP_FRAME_LEN &&
                 get16be(s_rx_buf + OFF_ETH_TYPE) == 0x0806u &&
@@ -391,10 +383,7 @@ static int arp_resolve(void)
             s_rx_len = 0;   /* not our reply — discard */
         }
 
-        printf("PD: ARP timeout #%d  ax0ok=%u ax0busy=%u ax1=%u cx=%u\r\n",
-               retry,
-               (unsigned)s_dbg_ax0_ok, (unsigned)s_dbg_ax0_busy,
-               (unsigned)s_dbg_ax1,    (unsigned)s_dbg_ax1_cx);
+        printf("PD: ARP timeout #%d\r\n", retry);
         rb_write("PD: ARP to retry="); rb_dec((unsigned)retry); rb_write("\r\n");
     }
 
@@ -431,26 +420,23 @@ void netw_pd_set_params(unsigned int pd_int, const char *local_ip_str)
 int netw_connect(char *host, int port, bool useTCP)
 {
     static uint8_t et_ip[2] = {0x08, 0x00};
-    int temp;
     (void)useTCP;
 
     s_server_port = (uint16_t)(unsigned)port;
     parse_ip4(host, s_server_ip);
 
-    /* Briefly open any handle to read the local MAC, then close it. */
-    temp = pd_access_type(0x0800u, et_ip);
-    if (temp < 0) {
-        printf("PD: access_type failed at INT %02Xh\r\n", s_pd_int);
-        rb_write("PD: access_type FAIL\r\n");
+    /* Open the permanent IP handle — used now for MAC lookup, kept for the TSR lifetime. */
+    s_ip_handle = pd_access_type(0x0800u, et_ip);
+    if (s_ip_handle < 0) {
+        printf("PD: access_type failed\r\n");
         return -1;
     }
-    if (pd_get_address(temp) != 0) {
-        pd_release_type(temp);
+    if (pd_get_address(s_ip_handle) != 0) {
+        pd_release_type(s_ip_handle);
+        s_ip_handle = -1;
         printf("PD: get_address failed\r\n");
-        rb_write("PD: get_addr FAIL\r\n");
         return -1;
     }
-    pd_release_type(temp);
 
     printf("PD: MAC %02X:%02X:%02X:%02X:%02X:%02X  local %u.%u.%u.%u\r\n",
            (unsigned)s_local_mac[0], (unsigned)s_local_mac[1],
@@ -459,17 +445,11 @@ int netw_connect(char *host, int port, bool useTCP)
            (unsigned)s_local_ip[0],  (unsigned)s_local_ip[1],
            (unsigned)s_local_ip[2],  (unsigned)s_local_ip[3]);
 
-    /* ARP: resolve server MAC. */
+    /* ARP: resolve server MAC (uses separate 0x0806 handle internally). */
     if (arp_resolve() != 0) {
+        pd_release_type(s_ip_handle);
+        s_ip_handle = -1;
         printf("PD: ARP failed\r\n");
-        return -1;
-    }
-
-    /* Register permanent IP receiver for the TNFS session. */
-    s_ip_handle = pd_access_type(0x0800u, et_ip);
-    if (s_ip_handle < 0) {
-        printf("PD: IP access_type failed\r\n");
-        rb_write("PD: IP handle FAIL\r\n");
         return -1;
     }
 
@@ -479,10 +459,35 @@ int netw_connect(char *host, int port, bool useTCP)
     return 0;
 }
 
+/* Prepare the receive path for a new TNFS exchange.
+ * Handle stays open permanently; we only send a gratuitous ARP to refresh
+ * the server's ARP cache (which expires after ~30 s idle) and clear the
+ * receive buffer so the previous exchange's reply cannot be mistaken for
+ * this one's. */
+int netw_open_rx(void)
+{
+    /* Gratuitous ARP: keep the server's ARP cache entry for our IP/MAC fresh
+     * so it can reply.  s_tx_buf is overwritten by netw_send() right after. */
+    arp_announce();
+
+    s_rx_len = 0;
+    if (rbuf.enabled) rb_write("PD: rx ready\r\n");
+    return 0;
+}
+
+void netw_close_rx(void)
+{
+    /* IP handle is held permanently; nothing to release between exchanges. */
+}
+
 void netw_disconnect(void)
 {
-    pd_release_type(s_ip_handle);
-    s_ip_handle = -1;
+    /* Release the permanent IP handle on shutdown only. */
+    if (s_ip_handle >= 0) {
+        rb_write("PD: IP close (shutdown)\r\n");
+        pd_release_type(s_ip_handle);
+        s_ip_handle = -1;
+    }
 }
 
 void netw_clear_rx(void)

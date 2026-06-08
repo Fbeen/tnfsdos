@@ -49,7 +49,7 @@ extrn   _do_getattr         : near   ; unsigned __cdecl (void)
 extrn   _do_open            : near   ; unsigned __cdecl (unsigned es, unsigned di)
 extrn   _do_spopen          : near   ; unsigned __cdecl (unsigned es, unsigned di)
 extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx)
-extrn   _do_close           : near   ; void __cdecl (void)
+extrn   _do_close           : near   ; void __cdecl (unsigned es, unsigned di)
 extrn   _do_diskspace       : near   ; void __cdecl (void)
 
 ;============================================================================
@@ -222,7 +222,10 @@ do_chdir_fail:
 
         ;--- AL=06h: CLOSE ---------------------------------------------------
 handle_1106:
+        push    word ptr [arg_di]
+        push    word ptr [arg_es]
         call    _do_close
+        add     sp, 4
         mov     [res_ax], 0
         jmp     do_tsr_ret_ok
 

@@ -14,6 +14,7 @@
  */
 
 #include <i86.h>
+#include <stdint.h>
 #include "ringbuf.h"
 #include "fs.h"
 #include "redirector.h"
@@ -175,7 +176,7 @@ unsigned int __cdecl do_open(unsigned int es_val, unsigned int di_val)
     }
     if (rbuf.enabled) rb_write("2F 1116 OPEN OK\r\n");
     fs_open(&node, &handle);
-    sft_fill_handle(&handle, (char far *)MK_FP(es_val, di_val));
+    sft_fill_handle(&handle, &node, (char far *)MK_FP(es_val, di_val));
     return 0;
 }
 
@@ -197,7 +198,7 @@ unsigned int __cdecl do_spopen(unsigned int es_val, unsigned int di_val)
     }
     if (rbuf.enabled) rb_write("2F 112E SPOP OK\r\n");
     fs_open(&node, &handle);
-    sft_fill_handle(&handle, (char far *)MK_FP(es_val, di_val));
+    sft_fill_handle(&handle, &node, (char far *)MK_FP(es_val, di_val));
     return 0;
 }
 
@@ -216,8 +217,9 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
     unsigned int nbytes;
     static FsHandle handle;
 
-    handle.dir_ctx = (int)(unsigned char)sft[0x0B];
-    handle.idx     = (int)(unsigned char)sft[0x0C];
+    handle.dir_ctx = 0;
+    handle.idx     = 0;
+    handle.tnfs_fd = (uint8_t)sft[0x07];
 
     dta_off = (unsigned int)(unsigned char)sda[0x0C]
             | ((unsigned int)(unsigned char)sda[0x0D] << 8);
@@ -254,6 +256,14 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
 /*  AL=06h  CLOSE  /  AL=0Ch  DISKSPACE                                 */
 /* ------------------------------------------------------------------ */
 
-void __cdecl do_close(void) { }
+void __cdecl do_close(unsigned int es_val, unsigned int di_val)
+{
+    char far *sft = (char far *)MK_FP(es_val, di_val);
+    static FsHandle handle;
+    handle.dir_ctx = 0;
+    handle.idx     = 0;
+    handle.tnfs_fd = (uint8_t)sft[0x07];
+    fs_close(&handle);
+}
 
 void __cdecl do_diskspace(void) { }

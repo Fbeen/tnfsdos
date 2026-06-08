@@ -13,10 +13,8 @@
 #include "ringbuf.h"
 #include "fs.h"
 #include "redirector.h"
-#ifndef TNFSDRV_PUREFAKE
 #include "netinit.h"
 #include "tnfs.h"
-#endif
 
 /* ------------------------------------------------------------------ */
 /*  ASM handler interface                                               */
@@ -147,13 +145,11 @@ int main(int argc, char *argv[])
     if (!config_load("TNFSDRV.CFG", profile, &cfg))
         printf("TNFSDRV.CFG not found, using defaults\r\n");
 
-#ifndef TNFSDRV_PUREFAKE
     if (strcmp(cfg.protocol, "UDP") != 0) {
         freopen("CON", "w", stdout);
         printf("TNFSDRV: protocol '%s' not supported (only UDP)\r\n", cfg.protocol);
         return 1;
     }
-#endif
 
     if (cfg.driveletter < 'C' || cfg.driveletter > 'Z') {
         freopen("CON", "w", stdout);
@@ -163,7 +159,6 @@ int main(int argc, char *argv[])
 
     printf("Profile:  %s\r\n",  cfg.profile);
     printf("Drive:    %c:\r\n", cfg.driveletter);
-#ifndef TNFSDRV_PUREFAKE
     printf("Server:   %s\r\n",  cfg.servername[0] ? cfg.servername : "(none)");
     printf("Root:     %s\r\n",  cfg.serverroot);
     printf("Protocol: %s  Port: %u\r\n", cfg.protocol, cfg.port);
@@ -173,7 +168,6 @@ int main(int argc, char *argv[])
         printf("TNFSDRV: connect failed — see log.txt\r\n");
         return 1;
     }
-#endif
 
     fs_set_drive(cfg.driveletter);
     printf("TNFSDRV loaded OK\r\n");
@@ -185,12 +179,15 @@ int main(int argc, char *argv[])
     _dos_setvect(0x2F, (void (__interrupt __far *)())new_int2f_);
 
     paras = calc_resident_paras();
-    freopen("CON", "w", stdout);
-    printf("Drive %c: installed", cfg.driveletter);
 #ifdef TNFSDRV_DEBUG_RINGBUF
     seg = get_ds();
     off = (unsigned int)&rbuf;
-    printf("  [buf %04X:%04X]", seg, off);
+    printf("BufAddr: %04X:%04X\r\n", seg, off);  /* to log.txt */
+#endif
+    freopen("CON", "w", stdout);
+    printf("Drive %c: installed", cfg.driveletter);
+#ifdef TNFSDRV_DEBUG_RINGBUF
+    printf("  [buf %04X:%04X]", seg, off);        /* to screen */
 #endif
     printf("\r\n");
     fclose(stdout);
