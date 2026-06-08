@@ -32,6 +32,7 @@
 ;   0Ch  DISKSPACE  AX=spc, BX=avail, CX=bps, DX=total
 ;   0Fh  GETATTR    → CX=attr
 ;   16h  OPEN       ES:DI=SFT
+;   25h  post-EXEC notify → AX=0 for N: paths, chain otherwise
 ;   2Eh  SPOPNFIL   ES:DI=SFT → CX=1
 ;   1Bh  FINDFIRST  → CF cleared/set
 ;   1Ch  FINDNEXT   ES:DI=DTA → CF cleared/set
@@ -51,6 +52,7 @@ extrn   _do_spopen          : near   ; unsigned __cdecl (unsigned es, unsigned d
 extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx)
 extrn   _do_close           : near   ; void __cdecl (unsigned es, unsigned di)
 extrn   _do_diskspace       : near   ; void __cdecl (void)
+extrn   _do_exec_notify     : near   ; unsigned __cdecl (void)
 
 ;============================================================================
 ; DGROUP data — all accessible via DS (=DGROUP) from within the handler
@@ -203,6 +205,8 @@ ENDIF
         je      handle_1116
         cmp     al, 2Eh
         je      handle_112E
+        cmp     al, 25h
+        je      handle_1125
         cmp     al, 1Bh
         je      handle_111B
         cmp     al, 1Ch
@@ -289,6 +293,14 @@ handle_112E:
 do_spopen_err:
         mov     [res_ax], ax
         jmp     do_tsr_ret_err
+
+        ;--- AL=25h: post-EXEC notify (no output buffer) ---------------------
+handle_1125:
+        call    _do_exec_notify
+        cmp     ax, 0FFFFh
+        je      do_tsr_chain
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 
         ;--- AL=1Bh: FINDFIRST -----------------------------------------------
 handle_111B:

@@ -245,7 +245,8 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
     sft[0x18] = (char)(pos >> 24);
 
     if (rbuf.enabled) {
-        rb_write("2F 1108 READ cnt="); rb_hex16(nbytes);
+        rb_write("2F 1108 READ req="); rb_hex16(cx_val);
+        rb_write(" got="); rb_hex16(nbytes);
         rb_write(" DTA="); rb_hex16(dta_seg); rb_putc(':'); rb_hex16(dta_off);
         rb_write("\r\n");
     }
@@ -267,3 +268,18 @@ void __cdecl do_close(unsigned int es_val, unsigned int di_val)
 }
 
 void __cdecl do_diskspace(void) { }
+
+/* ------------------------------------------------------------------ */
+/*  AL=25h  post-EXEC notification (no output buffer)                  */
+/* ------------------------------------------------------------------ */
+
+unsigned int __cdecl do_exec_notify(void)
+{
+    unsigned char c;
+    if (!glob_sdaptr) return 0xFFFFu;
+    c = (unsigned char)(glob_sdaptr[0x9E]);
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c != (unsigned char)('A' + g_drive_idx)) return 0xFFFFu;
+    if (rbuf.enabled) rb_write("2F 1125 OK\r\n");
+    return 0;
+}

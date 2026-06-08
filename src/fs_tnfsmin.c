@@ -160,13 +160,13 @@ static void dos_find_path_to_tnfs_dir_and_template(
             out_dir[1 + j] = '\0';
         }
     } else {
-        /* no wildcard: entire path (after prefix) is the directory */
+        /* no wildcard: split on last backslash; SDA FCB tmpl handles matching */
         out_tmpl[0] = '\0';
-        if (!raw[i]) {
+        if (last_bs < 0) {
             out_dir[0] = '/'; out_dir[1] = '\0';
         } else {
             out_dir[0] = '/';
-            for (j = 0; raw[i + j] && j < 126; j++) {
+            for (j = 0; (i + j) < last_bs && j < 126; j++) {
                 c = raw[i + j];
                 if (c == '\\') c = '/';
                 if (c >= 'a' && c <= 'z') c -= 32;
@@ -467,19 +467,21 @@ void fs_open(const FsNode *node, FsHandle *handle)
 unsigned int fs_read(const FsHandle *handle, unsigned long pos,
                      char far *buf, unsigned int n)
 {
-    int got;
-    unsigned int i;
+    unsigned int total = 0, chunk, got, i;
 
     if (handle->tnfs_fd == 0xFF) return 0;
-    if (n > sizeof(s_read_buf)) n = (unsigned int)sizeof(s_read_buf);
+    tnfs_lseek(handle->tnfs_fd, 0, (uint32_t)pos);
 
-    tnfs_lseek(handle->tnfs_fd, 0, (uint32_t)pos); /* SEEK_SET = 0 */
-
-    got = tnfs_read(s_read_buf, handle->tnfs_fd, (uint16_t)n);
-    if (got <= 0) return 0;
-
-    for (i = 0; i < (unsigned int)got; i++) buf[i] = s_read_buf[i];
-    return (unsigned int)got;
+    while (total < n) {
+        chunk = n - total;
+        if (chunk > sizeof(s_read_buf)) chunk = (unsigned int)sizeof(s_read_buf);
+        got = (unsigned int)tnfs_read(s_read_buf, handle->tnfs_fd, (uint16_t)chunk);
+        if (got == 0) break;
+        for (i = 0; i < got; i++) buf[total + i] = s_read_buf[i];
+        total += got;
+        if (got < chunk) break;
+    }
+    return total;
 }
 
 void fs_close(const FsHandle *handle)

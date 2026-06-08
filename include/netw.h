@@ -26,6 +26,8 @@ extern "C" {
 #endif
 
 void netw_clear_rx(void);
+int  netw_open_rx(void);
+void netw_close_rx(void);
 
 int  netw_send(const uint8_t *buffer, int length);
 int  netw_recv(uint8_t *buffer, int buffer_size);

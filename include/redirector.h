@@ -17,7 +17,8 @@ unsigned int __cdecl do_open     (unsigned int es_val, unsigned int di_val);
 unsigned int __cdecl do_spopen   (unsigned int es_val, unsigned int di_val);
 unsigned int __cdecl do_read     (unsigned int es_val, unsigned int di_val,
                                    unsigned int cx_val);
-void         __cdecl do_close    (unsigned int es_val, unsigned int di_val);
-void         __cdecl do_diskspace(void);
+void         __cdecl do_close       (unsigned int es_val, unsigned int di_val);
+void         __cdecl do_diskspace   (void);
+unsigned int __cdecl do_exec_notify (void);
 
 #endif
