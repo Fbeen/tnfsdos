@@ -22,7 +22,7 @@
 
 /* Must match main.c exactly */
 #define RING_MAGIC  0xBEEFu
-#define RING_SIZE   4096
+#define RING_SIZE   16384
 
 typedef struct {
     unsigned int  magic;

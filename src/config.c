@@ -68,6 +68,19 @@ static void apply_key(TnfsDrvConfig *cfg, const char *key, const char *value)
         char c = value[0];
         if (c >= 'a' && c <= 'z') c -= 32;
         if (c >= 'A' && c <= 'Z') cfg->driveletter = c;
+    } else if (str_eq_ci(key, "localip")) {
+        strncpy(cfg->localip, value, sizeof(cfg->localip) - 1);
+        cfg->localip[sizeof(cfg->localip) - 1] = '\0';
+    } else if (str_eq_ci(key, "netmask")) {
+        strncpy(cfg->netmask, value, sizeof(cfg->netmask) - 1);
+        cfg->netmask[sizeof(cfg->netmask) - 1] = '\0';
+    } else if (str_eq_ci(key, "gateway")) {
+        strncpy(cfg->gateway, value, sizeof(cfg->gateway) - 1);
+        cfg->gateway[sizeof(cfg->gateway) - 1] = '\0';
+    } else if (str_eq_ci(key, "packetint")) {
+        /* Accept decimal or 0x hex: strtol handles both. */
+        unsigned long v = strtoul(value, (char **)0, 0);
+        if (v > 0 && v <= 0xFF) cfg->packetint = (unsigned int)v;
     }
 }
 
@@ -134,6 +147,10 @@ void config_set_defaults(TnfsDrvConfig *cfg)
     cfg->protocol[sizeof(cfg->protocol) - 1] = '\0';
     cfg->port        = 16384;
     cfg->driveletter = (char)TNFSDRV_DRIVE_LETTER;
+    cfg->localip[0]  = '\0';
+    cfg->netmask[0]  = '\0';
+    cfg->gateway[0]  = '\0';
+    cfg->packetint   = 0x60;
 }
 
 int config_load(const char *filename, const char *profile, TnfsDrvConfig *cfg)

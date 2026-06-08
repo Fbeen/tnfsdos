@@ -71,4 +71,5 @@ int fs_enum_begin(const char far *path, const char far *tmpl, FsDirEnum *de);
 /* Advance; fills *node if a match is found.  Returns 1 on match, 0 at EOF. */
 int fs_enum_next(FsDirEnum *de, FsNode *node);
 
+
 #endif

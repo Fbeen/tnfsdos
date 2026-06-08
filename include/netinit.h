@@ -2,11 +2,11 @@
 #define NETINIT_H
 #include "config.h"
 
-/* Initialise mTCP, resolve server hostname, send TNFS mount.
+/* Set up packet-driver backend, ARP-resolve server, TNFS mount.
  * Prints status to stdout.  Returns 0 on success, -1 on any failure. */
 int  tnfsdrv_connect(const TnfsDrvConfig *cfg);
 
-/* Tear down mTCP stack (unhooks timer interrupt). Call after connect succeeds. */
+/* Release packet-driver handle (only call if not going TSR). */
 void tnfsdrv_disconnect(void);
 
 #endif

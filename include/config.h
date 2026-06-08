@@ -17,6 +17,11 @@ typedef struct {
     char         protocol[8];   /* always stored uppercase */
     unsigned int port;
     char         driveletter;   /* always uppercase A-Z */
+    /* TNFSPD-specific fields (ignored by mTCP builds) */
+    char         localip[16];   /* local (486) IP as dotted-decimal    */
+    char         netmask[16];   /* netmask — parsed but currently unused */
+    char         gateway[16];   /* gateway — parsed but currently unused */
+    unsigned int packetint;     /* packet driver interrupt, default 0x60 */
 } TnfsDrvConfig;
 
 /* Fill *cfg with built-in defaults (no file I/O). */

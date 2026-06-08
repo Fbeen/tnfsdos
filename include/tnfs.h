@@ -25,10 +25,18 @@ extern "C" {
 #endif
 
 #define TNFS_PORT 16384		// port 16384 is the standard port for the tnfs protocol
-#define TNFS_MAX_PATH_LEN 128	// maximum length of a complete file path
-#define TNFS_BUFFERSIZE 2048	// 2 kibibytes buffer to send and receive tnfs data
+#define TNFS_MAX_PATH_LEN 64	// maximum length of a complete file path
+#define TNFS_BUFFERSIZE 1024	// send/receive buffer (must fit TNFS_DIRX_REQUIRED)
+#define TNFS_MAX_RESULTS 4	// max directory entries per readdirx call
 #define TNFS_SEND_RETRIES 5	// repeat sending commands up to x times before giving up
 #define TNFS_NET_TIMEOUT_MS 2000// timeout in microseconds if the server doesn't respond.
+
+/* Compile-time sanity check: buffer must fit the largest possible readdirx response */
+#define TNFS_DIRX_ENTRY_MAX  (13 + TNFS_MAX_PATH_LEN)
+#define TNFS_DIRX_REQUIRED   (10 + TNFS_DIRX_ENTRY_MAX * TNFS_MAX_RESULTS)
+#if TNFS_DIRX_REQUIRED > TNFS_BUFFERSIZE
+#error TNFS_BUFFERSIZE too small for TNFS_MAX_RESULTS and TNFS_MAX_PATH_LEN
+#endif
 
 #define TNFS_DIRENTRY_DIR       0x01
 #define TNFS_DIRENTRY_HIDDEN    0x02
@@ -142,6 +150,7 @@ char* tnfs_get_buffer();
 void tnfs_connect(char* host, bool useTCP);
 void tnfs_disconnect();
 int  tnfs_mount(const char* dir, const char* username, const char* password);
+int  tnfs_remount(void);   /* re-mount with saved root; use when session dies after closedir */
 int  tnfs_umount();
 int  tnfs_opendir(const char* dir);
 int  tnfs_readdir(char handle, char* dest);

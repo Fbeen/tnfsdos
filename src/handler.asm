@@ -2,9 +2,7 @@
 ; HANDLER.ASM  -  TNFSDRV INT 2Fh network redirector handler
 ; Assemble: wasm -2 -ms handler.asm
 ;
-; Handles INT 2Fh AH=11h (MS-DOS network redirector API) for virtual drive T:.
-;
-; Stack layout after push sequence + mov bp,sp:
+; Stack layout after push sequence + mov bp,sp (still on CALLER's SS:SP):
 ;   [bp+ 0] BP      [bp+10] DX
 ;   [bp+ 2] ES      [bp+12] CX
 ;   [bp+ 4] DS *    [bp+14] BX
@@ -14,32 +12,97 @@
 ;                   [bp+22] FLAGS/
 ;   * = caller's DS (NOT DGROUP; handler sets DS=DGROUP on entry)
 ;
+; PRIVATE STACK:
+;   All C function calls (do_*, log_2f_call) run on tsr_stack in DGROUP.
+;   Before each C call the handler saves the caller SS:BP, switches to
+;   tsr_tos, and restores them before the final pop/iret sequence.
+;   [bp+N] is only valid BEFORE the switch (reading args) and AFTER the
+;   restore (writing results).  In between, the res_* DGROUP globals are
+;   used to ferry return values across the boundary.
+;
+; REENTRANCY GUARD:
+;   in_handler is set to 1 on entry and cleared before returning.
+;   If INT 2Fh fires again while we are inside (e.g. from the packet
+;   driver callback), the nested call returns immediately with error.
+;
 ; Subfunctions handled (AL value):
-;   05h  CHDIR      — validate path via SDA->fn1
-;   06h  CLOSE      — always succeed
-;   08h  READ       — copy fake content to SDA->curr_dta
-;   0Fh  GETATTR    — return attribute from SDA->fn1
-;   16h  OPEN       — fill SFT for README.TXT
-;   2Eh  SPOPNFIL   — same as OPEN + CX=1 (used by TYPE/COPY in DOS 5+/6.x)
-;   0Ch  DISKSPACE  — return fake 16 MB volume info (AX/BX/CX/DX)
-;   1Bh  FINDFIRST  — fn1+template-based directory entry dispatch
-;   1Ch  FINDNEXT   — DTA dir_entry sequence counter
+;   05h  CHDIR
+;   06h  CLOSE
+;   08h  READ       ES:DI=SFT, CX=bytes → CX=bytes read
+;   0Ch  DISKSPACE  AX=spc, BX=avail, CX=bps, DX=total
+;   0Fh  GETATTR    → CX=attr
+;   16h  OPEN       ES:DI=SFT
+;   2Eh  SPOPNFIL   ES:DI=SFT → CX=1
+;   1Bh  FINDFIRST  → CF cleared/set
+;   1Ch  FINDNEXT   ES:DI=DTA → CF cleared/set
 ;   other — log + chain to old vector
 ;============================================================================
 
         .model  small
 
 extrn   _old_int2f          : dword
-extrn   _log_2f_call        : near   ; void __cdecl (unsigned ax, unsigned bx, unsigned cx, unsigned dx, unsigned ds, unsigned si, unsigned es, unsigned di)
-extrn   _do_chdir           : near   ; unsigned __cdecl (void) — 0=ok, 3=path not found
+extrn   _log_2f_call        : near   ; void __cdecl (ax,bx,cx,dx,ds,si,es,di)
+extrn   _do_chdir           : near   ; unsigned __cdecl (void)
 extrn   _do_findfirst       : near   ; unsigned __cdecl (void)
 extrn   _do_findnext        : near   ; unsigned __cdecl (unsigned es, unsigned di)
-extrn   _do_getattr         : near   ; unsigned __cdecl (void) — 0xFFFF=not found, else attr byte
-extrn   _do_open            : near   ; unsigned __cdecl (unsigned es, unsigned di) — 0=ok, else error
-extrn   _do_spopen          : near   ; unsigned __cdecl (unsigned es, unsigned di) — 0=ok, else error
-extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx) — buf from SDA->curr_dta
+extrn   _do_getattr         : near   ; unsigned __cdecl (void)
+extrn   _do_open            : near   ; unsigned __cdecl (unsigned es, unsigned di)
+extrn   _do_spopen          : near   ; unsigned __cdecl (unsigned es, unsigned di)
+extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx)
 extrn   _do_close           : near   ; void __cdecl (void)
-extrn   _do_diskspace       : near   ; void __cdecl (void) — log only; registers set in ASM
+extrn   _do_diskspace       : near   ; void __cdecl (void)
+
+;============================================================================
+; DGROUP data — all accessible via DS (=DGROUP) from within the handler
+;============================================================================
+_DATA   segment word public 'DATA'
+
+; Caller SS:SP saved before stack switch (sp = bp = top of push frame)
+IFNDEF NOSTACK
+saved_ss    dw  0
+saved_sp    dw  0
+ENDIF
+
+; Caller register values copied before the stack switch
+arg_ax      dw  0
+arg_bx      dw  0
+arg_cx      dw  0
+arg_dx      dw  0
+arg_di      dw  0
+arg_es      dw  0
+arg_si      dw  0
+arg_ds_val  dw  0
+
+; Result values to write back to caller frame after stack restore
+res_ax      dw  0
+res_bx      dw  0
+res_cx      dw  0
+res_dx      dw  0
+
+; Reentrancy guard: 0=idle, 1=inside handler
+; Exported as _in_handler so C debug code can read it.
+public _in_handler
+_in_handler db  0
+            db  0               ; padding for word alignment
+
+IFNDEF NOSTACK
+; Stack canary BELOW the buffer (overflow direction).
+; If the stack uses all 8192 bytes it will corrupt this word.
+public  _tsr_stack_lo_canary
+_tsr_stack_lo_canary    dw  0A55Ah
+
+; Private TSR stack — 8192 bytes, grows downward from tsr_tos.
+; Filled with 0xCC so depth can be measured: count intact bytes from [0].
+public  _tsr_stack
+_tsr_stack              db  8192 dup(0CCh)
+tsr_tos                 label word
+
+; Canary ABOVE the top of stack (should never be touched).
+public  _tsr_stack_hi_canary
+_tsr_stack_hi_canary    dw  05AA5h
+ENDIF
+
+_DATA   ends
 
 ;============================================================================
 _TEXT   segment byte public 'CODE'
@@ -49,7 +112,7 @@ old2f_off   dw  0           ; filled by init_int2f_ptr__
 old2f_seg   dw  0
 
 ;============================================================================
-; INT 2Fh handler — dispatches AH=11h subfunctions; all others log + chain.
+; INT 2Fh handler
 ;============================================================================
 public  new_int2f__
 new_int2f__ proc far
@@ -62,16 +125,70 @@ new_int2f__ proc far
         push    ds
         push    es
         push    bp
-        mov     bp, sp
+        mov     bp, sp                  ; BP = top of saved frame on caller SS
 
         mov     ax, DGROUP
-        mov     ds, ax
+        mov     ds, ax                  ; DS = DGROUP; SS still = caller's
 
-        mov     ax, [bp+16]
+        mov     ax, [bp+16]             ; saved AX
         cmp     ah, 11h
-        jne     do_2f_pass
+        jne     do_2f_chain             ; not our subfunction — chain immediately
 
-        ;--- dispatch on AL ---------------------------------------------------
+        ;--------------------------------------------------------------------
+        ; AH=11h — network redirector subfunction for our drive.
+        ;
+        ; 1. Reentrancy check  (guard against recursive invocation)
+        ; 2. Copy register args from [bp+N] to DGROUP globals
+        ; 3. Save caller SS:SP, switch to private TSR stack
+        ; 4. Dispatch on AL, call C helpers
+        ; 5. Restore caller SS:SP, write results to [bp+N], return
+        ;--------------------------------------------------------------------
+
+        ; 1. Reentrancy check
+        cmp     byte ptr [_in_handler], 0
+        jne     do_reentry_err
+
+        ; 2. Copy args to DGROUP globals (while still on caller's SS)
+        mov     [arg_ax], ax            ; AX already loaded above
+        mov     ax, [bp+14]
+        mov     [arg_bx], ax
+        mov     ax, [bp+12]
+        mov     [arg_cx], ax
+        mov     ax, [bp+10]
+        mov     [arg_dx], ax
+        mov     ax, [bp+6]
+        mov     [arg_di], ax
+        mov     ax, [bp+2]
+        mov     [arg_es], ax
+        mov     ax, [bp+8]
+        mov     [arg_si], ax
+        mov     ax, [bp+4]
+        mov     [arg_ds_val], ax
+
+        ; 3. Switch to private TSR stack (skipped with NOSTACK — C runs on caller SS:SP)
+IFNDEF NOSTACK
+        cli
+        mov     [saved_ss], ss
+        mov     [saved_sp], bp
+        mov     ax, DGROUP
+        mov     ss, ax
+        mov     sp, offset tsr_tos
+        sti
+ENDIF
+
+        mov     byte ptr [_in_handler], 1
+
+        ; Initialise result regs: default = preserve caller's values
+        mov     ax, [arg_bx]
+        mov     [res_bx], ax
+        mov     ax, [arg_cx]
+        mov     [res_cx], ax
+        mov     ax, [arg_dx]
+        mov     [res_dx], ax
+
+        ; 4. Dispatch on AL
+        mov     al, byte ptr [arg_ax]   ; lo byte of saved AX
+
         cmp     al, 05h
         je      handle_1105
         cmp     al, 06h
@@ -92,161 +209,142 @@ new_int2f__ proc far
         je      handle_111C
         jmp     do_2f_log
 
-        ;--- AL=05h: CHDIR — validate path via SDA->fn1 ----------------------
+        ;--- AL=05h: CHDIR ---------------------------------------------------
 handle_1105:
         call    _do_chdir
         test    ax, ax
         jnz     do_chdir_fail
-        mov     word ptr [bp+16], 0
-        jmp     do_2f_ret_ok
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 do_chdir_fail:
-        mov     word ptr [bp+16], ax    ; AX = 3 (path not found)
-        jmp     do_2f_ret_err
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
 
-        ;--- AL=06h: CLOSE — return success ----------------------------------
+        ;--- AL=06h: CLOSE ---------------------------------------------------
 handle_1106:
         call    _do_close
-        mov     word ptr [bp+16], 0
-        jmp     do_2f_ret_ok
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 
-        ;--- AL=08h: READ — ES:DI=SFT, CX=bytes, buf from SDA->curr_dta ------
+        ;--- AL=08h: READ  (ES:DI=SFT, CX=count) ----------------------------
 handle_1108:
-        push    word ptr [bp+12]    ; cx_val   (3rd arg)
-        push    word ptr [bp+6]     ; di_val   (2nd arg)
-        push    word ptr [bp+2]     ; es_val   (1st arg)
+        push    word ptr [arg_cx]       ; cx_val  (3rd arg)
+        push    word ptr [arg_di]       ; di_val  (2nd arg)
+        push    word ptr [arg_es]       ; es_val  (1st arg)
         call    _do_read
         add     sp, 6
-        mov     word ptr [bp+12], ax    ; CX = bytes read
-        mov     word ptr [bp+16], 0     ; AX = 0
-        jmp     do_2f_ret_ok
+        mov     [res_cx], ax            ; CX = bytes actually read
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 
-        ;--- AL=0Ch: DISKSPACE — fake 16 MB (8 sec/clus * 512 B/sec * 4096 clus) -
+        ;--- AL=0Ch: DISKSPACE -----------------------------------------------
 handle_110C:
         call    _do_diskspace
-        mov     word ptr [bp+16], 8     ; AX = sectors per cluster
-        mov     word ptr [bp+14], 4096  ; BX = available clusters
-        mov     word ptr [bp+12], 512   ; CX = bytes per sector
-        mov     word ptr [bp+10], 4096  ; DX = total clusters
-        jmp     do_2f_ret_ok
+        mov     [res_ax], 8
+        mov     [res_bx], 4096
+        mov     [res_cx], 512
+        mov     [res_dx], 4096
+        jmp     do_tsr_ret_ok
 
-        ;--- AL=0Fh: GETATTR — filename from SDA->fn1 ------------------------
+        ;--- AL=0Fh: GETATTR -------------------------------------------------
 handle_110F:
         call    _do_getattr
         cmp     ax, 0FFFFh
         je      do_110F_nf
-        mov     word ptr [bp+12], ax    ; CX = attribute
-        mov     word ptr [bp+16], 0     ; AX = 0
-        jmp     do_2f_ret_ok
+        mov     [res_cx], ax            ; CX = attribute byte
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 do_110F_nf:
-        mov     word ptr [bp+16], 2     ; AX = 2 (file not found)
-        jmp     do_2f_ret_err
+        mov     [res_ax], 2             ; file not found
+        jmp     do_tsr_ret_err
 
-        ;--- AL=16h: OPEN — ES:DI=SFT ----------------------------------------
+        ;--- AL=16h: OPEN  (ES:DI=SFT) ---------------------------------------
 handle_1116:
-        push    word ptr [bp+6]     ; di_val (2nd arg)
-        push    word ptr [bp+2]     ; es_val (1st arg)
+        push    word ptr [arg_di]
+        push    word ptr [arg_es]
         call    _do_open
         add     sp, 4
         test    ax, ax
         jnz     do_open_err
-        mov     word ptr [bp+16], 0
-        jmp     do_2f_ret_ok
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 do_open_err:
-        mov     word ptr [bp+16], ax
-        jmp     do_2f_ret_err
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
 
-        ;--- AL=2Eh: SPOPNFIL — same SFT fill, CX=1 (TYPE/COPY in DOS 5+/6.x) -
+        ;--- AL=2Eh: SPOPNFIL  (ES:DI=SFT) ----------------------------------
 handle_112E:
-        push    word ptr [bp+6]     ; di_val (2nd arg)
-        push    word ptr [bp+2]     ; es_val (1st arg)
+        push    word ptr [arg_di]
+        push    word ptr [arg_es]
         call    _do_spopen
         add     sp, 4
         test    ax, ax
         jnz     do_spopen_err
-        mov     word ptr [bp+12], 1     ; CX = 1 (action: file opened)
-        mov     word ptr [bp+16], 0     ; AX = 0
-        jmp     do_2f_ret_ok
+        mov     [res_cx], 1             ; CX = 1 (file opened)
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 do_spopen_err:
-        mov     word ptr [bp+16], ax
-        jmp     do_2f_ret_err
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
 
-        ;--- AL=1Bh: FINDFIRST — uses glob_sdaptr, classified by fn1+template -
+        ;--- AL=1Bh: FINDFIRST -----------------------------------------------
 handle_111B:
         call    _do_findfirst
-        mov     word ptr [bp+16], ax
+        mov     [res_ax], ax
         test    ax, ax
-        jnz     do_ff_nf
-        pop     bp
-        pop     es
-        pop     ds
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        push    bp
-        mov     bp, sp
-        and     word ptr [bp+6], 0FFFEh
-        pop     bp
-        iret
-do_ff_nf:
-        pop     bp
-        pop     es
-        pop     ds
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        push    bp
-        mov     bp, sp
-        or      word ptr [bp+6], 0001h
-        pop     bp
-        iret
+        jnz     do_tsr_ret_err          ; error: CF=1
+        jmp     do_tsr_ret_ok           ; success: CF=0
 
-        ;--- AL=1Ch: FINDNEXT — ES:DI is the DTA from FINDFIRST ---------------
+        ;--- AL=1Ch: FINDNEXT  (ES:DI=DTA from FINDFIRST) -------------------
 handle_111C:
-        push    word ptr [bp+6]     ; di_val (2nd arg)
-        push    word ptr [bp+2]     ; es_val (1st arg)
+        push    word ptr [arg_di]
+        push    word ptr [arg_es]
         call    _do_findnext
         add     sp, 4
-        mov     word ptr [bp+16], ax
+        mov     [res_ax], ax
         test    ax, ax
-        jnz     do_fn_eof
-        pop     bp
-        pop     es
-        pop     ds
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        push    bp
-        mov     bp, sp
-        and     word ptr [bp+6], 0FFFEh
-        pop     bp
-        iret
-do_fn_eof:
-        pop     bp
-        pop     es
-        pop     ds
-        pop     di
-        pop     si
-        pop     dx
-        pop     cx
-        pop     bx
-        pop     ax
-        push    bp
-        mov     bp, sp
-        or      word ptr [bp+6], 0001h
-        pop     bp
-        iret
+        jnz     do_tsr_ret_err          ; EOF/error: CF=1
+        jmp     do_tsr_ret_ok           ; found: CF=0
 
-        ;--- Shared success/error return paths --------------------------------
-do_2f_ret_ok:
+        ;--- unhandled AH=11h: log then chain --------------------------------
+do_2f_log:
+        push    word ptr [arg_di]       ; di_val  (8th arg, rightmost)
+        push    word ptr [arg_es]       ; es_val  (7th)
+        push    word ptr [arg_si]       ; si_val  (6th)
+        push    word ptr [arg_ds_val]   ; ds_val  (5th)
+        push    word ptr [arg_dx]       ; dx_val  (4th)
+        push    word ptr [arg_cx]       ; cx_val  (3rd)
+        push    word ptr [arg_bx]       ; bx_val  (2nd)
+        push    word ptr [arg_ax]       ; ax_val  (1st, leftmost)
+        call    _log_2f_call
+        add     sp, 16
+        jmp     do_tsr_chain
+
+        ;====================================================================
+        ; TSR stack restore + return paths
+        ; All paths arrive here with results in res_ax / res_bx / res_cx / res_dx.
+        ; Restore caller SS:SP, write results to the saved frame, then IRET.
+        ;====================================================================
+
+        ; CF=0 (success) — write all result registers, clear carry
+do_tsr_ret_ok:
+        mov     byte ptr [_in_handler], 0
+IFNDEF NOSTACK
+        cli
+        mov     ax, [saved_ss]
+        mov     ss, ax
+        mov     sp, [saved_sp]          ; sp = bp = top of saved frame
+        sti
+ENDIF
+        ; BP is still the correct frame pointer (never modified)
+        mov     ax, [res_ax]
+        mov     word ptr [bp+16], ax
+        mov     ax, [res_bx]
+        mov     word ptr [bp+14], ax
+        mov     ax, [res_cx]
+        mov     word ptr [bp+12], ax
+        mov     ax, [res_dx]
+        mov     word ptr [bp+10], ax
         pop     bp
         pop     es
         pop     ds
@@ -261,7 +359,19 @@ do_2f_ret_ok:
         and     word ptr [bp+6], 0FFFEh ; CF = 0
         pop     bp
         iret
-do_2f_ret_err:
+
+        ; CF=1 (error) — write AX (error code), set carry
+do_tsr_ret_err:
+        mov     byte ptr [_in_handler], 0
+IFNDEF NOSTACK
+        cli
+        mov     ax, [saved_ss]
+        mov     ss, ax
+        mov     sp, [saved_sp]
+        sti
+ENDIF
+        mov     ax, [res_ax]
+        mov     word ptr [bp+16], ax
         pop     bp
         pop     es
         pop     ds
@@ -277,20 +387,23 @@ do_2f_ret_err:
         pop     bp
         iret
 
-        ;--- all other AH=11h calls: log + chain to old vector ---------------
-do_2f_log:
-        push    word ptr [bp+6]     ; di_val  (8th arg, rightmost)
-        push    word ptr [bp+2]     ; es_val  (7th arg)
-        push    word ptr [bp+8]     ; si_val  (6th arg)
-        push    word ptr [bp+4]     ; ds_val  (5th arg)
-        push    word ptr [bp+10]    ; dx_val  (4th arg)
-        push    word ptr [bp+12]    ; cx_val  (3rd arg)
-        push    word ptr [bp+14]    ; bx_val  (2nd arg)
-        push    ax                  ; ax_val  (1st arg, leftmost)
-        call    _log_2f_call
-        add     sp, 16
+        ; Restore and chain to old handler (log path falls through here)
+do_tsr_chain:
+        mov     byte ptr [_in_handler], 0
+IFNDEF NOSTACK
+        cli
+        mov     ax, [saved_ss]
+        mov     ss, ax
+        mov     sp, [saved_sp]
+        sti
+ENDIF
+        ; fall through to do_2f_chain
 
-do_2f_pass:
+        ;====================================================================
+        ; Chain to previous INT 2Fh vector (no stack restore needed for
+        ; direct chain; stack already restored above for tsr path)
+        ;====================================================================
+do_2f_chain:
         pop     bp
         pop     es
         pop     ds
@@ -300,8 +413,30 @@ do_2f_pass:
         pop     cx
         pop     bx
         pop     ax
-        db      02Eh, 0FFh, 02Eh    ; jmp cs:[old2f_off]
+        db      02Eh, 0FFh, 02Eh        ; jmp cs:[old2f_off]  (far indirect)
         dw      offset old2f_off
+
+        ;====================================================================
+        ; Reentrancy detected — return AX=2 (path not found), CF=1
+        ; We are still on the caller's stack (no TSR switch done).
+        ;====================================================================
+do_reentry_err:
+        mov     word ptr [bp+16], 2
+        pop     bp
+        pop     es
+        pop     ds
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        push    bp
+        mov     bp, sp
+        or      word ptr [bp+6], 0001h  ; CF = 1
+        pop     bp
+        iret
+
 new_int2f__ endp
 
 ;============================================================================

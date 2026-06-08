@@ -66,13 +66,6 @@ unsigned int __cdecl do_findfirst(void)
     tmpl      = sda + 0x22B;
     srch_attr = (unsigned char)sda[0x24D];
 
-    if (rbuf.enabled) {
-        rb_write("2F 111B fn1=\""); rb_far_str(FP_SEG(fn1), FP_OFF(fn1), 32);
-        rb_write("\" t=");
-        for (k = 0; k < 11; k++) { char c = tmpl[k]; rb_putc(c >= 0x20 ? c : '.'); }
-        rb_write("\r\n");
-    }
-
     found = sda + 0x1B3;
     for (k = 0; k < 32; k++) found[k] = 0;
 
@@ -160,11 +153,6 @@ unsigned int __cdecl do_getattr(void)
 {
     static FsNode node;
     if (!glob_sdaptr) return 0xFFFF;
-    if (rbuf.enabled) {
-        rb_write("2F 110F \"");
-        rb_far_str(FP_SEG(glob_sdaptr + 0x9E), FP_OFF(glob_sdaptr + 0x9E), 32);
-        rb_write("\"\r\n");
-    }
     if (!fs_resolve(glob_sdaptr + 0x9E, &node)) return 0xFFFF;
     return fs_get_attr(&node);
 }
@@ -266,12 +254,6 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
 /*  AL=06h  CLOSE  /  AL=0Ch  DISKSPACE                                 */
 /* ------------------------------------------------------------------ */
 
-void __cdecl do_close(void)
-{
-    if (rbuf.enabled) rb_write("2F 1106 CLOSE\r\n");
-}
+void __cdecl do_close(void) { }
 
-void __cdecl do_diskspace(void)
-{
-    if (rbuf.enabled) rb_write("2F 110C DISKSPACE 16MB\r\n");
-}
+void __cdecl do_diskspace(void) { }
