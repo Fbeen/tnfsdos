@@ -9,6 +9,9 @@
 extern char far *glob_sdaptr;
 
 /* INT 2Fh AH=11h handler functions (called from handler.asm) */
+unsigned int __cdecl do_setcurdir(void);
+unsigned int __cdecl do_rmdir    (void);
+unsigned int __cdecl do_mkdir    (void);
 unsigned int __cdecl do_chdir    (void);
 unsigned int __cdecl do_findfirst(void);
 unsigned int __cdecl do_findnext (unsigned int es_val, unsigned int di_val);
@@ -19,6 +22,8 @@ unsigned int __cdecl do_read     (unsigned int es_val, unsigned int di_val,
                                    unsigned int cx_val);
 void         __cdecl do_close       (unsigned int es_val, unsigned int di_val);
 void         __cdecl do_diskspace   (void);
+unsigned int __cdecl do_setattr     (unsigned int cx_val);
+unsigned int __cdecl do_delete      (void);
 unsigned int __cdecl do_exec_notify (void);
 
 #endif

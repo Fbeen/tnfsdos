@@ -21,8 +21,8 @@ static const char *al_name(unsigned char al)
     case 0x0A: return "LOCK";
     case 0x0B: return "UNLOCK";
     case 0x0C: return "DISKSPACE";
-    case 0x0D: return "SETATTR";
-    case 0x0E: return "GETVOL";
+    case 0x0D: return "AL=0D";
+    case 0x0E: return "SETATTR";
     case 0x0F: return "GETATTR";
     case 0x10: return "DELETE";
     case 0x11: return "RENAME";

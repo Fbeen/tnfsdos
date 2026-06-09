@@ -290,6 +290,8 @@ static int load_dir_cache(const char *path)
 
     if (rbuf.enabled) { rb_write("DC_REQ path=\""); rb_write(path); rb_write("\"\r\n"); }
 
+    s_active_valid = 0; /* cache disabled — remove this line to re-enable */
+
     /* Cache hit — same directory already loaded, no TNFS needed */
     if (s_active_valid && strcmp(s_active_path, path) == 0) {
         if (rbuf.enabled) { rb_write("DC_HIT path=\""); rb_write(path); rb_write("\"\r\n"); }
@@ -482,6 +484,107 @@ unsigned int fs_read(const FsHandle *handle, unsigned long pos,
         if (got < chunk) break;
     }
     return total;
+}
+
+/* Convert fn1 DOS path to TNFS path (static buffer, 128 bytes). Returns 1 ok, 0 not our drive. */
+static int fn1_to_tnfs_path(const char far *fn1, char *out, int maxlen)
+{
+    int i, j;
+    char c;
+    if (!fn1_has_prefix(fn1)) return 0;
+    for (i = 0; s_drv_prefix[i]; i++) ;
+    out[0] = '/';
+    j = 1;
+    while (fn1[i] && j < maxlen - 1) {
+        c = fn1[i++];
+        if (c == '\\') c = '/';
+        if (c >= 'a' && c <= 'z') c -= 32;
+        out[j++] = c;
+    }
+    out[j] = '\0';
+    return 1;
+}
+
+int fs_mkdir(const char far *fn1)
+{
+    static char path[128];
+    int rc;
+    if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
+    rc = tnfs_mkdir(path);
+    s_active_valid = 0;
+    return rc;
+}
+
+int fs_rmdir(const char far *fn1)
+{
+    static char path[128];
+    int rc;
+    if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
+    rc = tnfs_rmdir(path);
+    s_active_valid = 0;
+    return rc;
+}
+
+int fs_delete(const char far *fn1)
+{
+    static char path[128];
+    if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
+    s_active_valid = 0;
+    return tnfs_unlink(path);
+}
+
+/* POSIX permission bit masks used by fs_getattr_stat / fs_setattr.
+ * Values match the standard Linux/POSIX definitions (see chmod(2)).
+ * S_IFMT (0xF000) is stripped before calling tnfs_chmod — the server
+ * expects permission bits only, not the file-type field from stat. */
+#define POSIX_S_IFDIR    0x4000u          /* directory type bit from stat */
+#define POSIX_WRITE_MASK 0x0092u          /* S_IWUSR|S_IWGRP|S_IWOTH     */
+#define POSIX_S_IWUSR    0x0080u          /* owner-write bit              */
+
+int fs_getattr_stat(const char far *fn1, unsigned char *attr_out)
+{
+    static char path[128];
+    static struct fstat st;
+    unsigned char attr;
+    if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return 0;
+    if (rbuf.enabled) { rb_write("ATTR GET tnfs="); rb_write(path); rb_write("\r\n"); }
+    if (tnfs_stat(path, &st) != 0) return 0;
+    if (rbuf.enabled) { rb_write("ATTR STAT mode="); rb_hex16((unsigned int)st.mode); rb_write("\r\n"); }
+    if (st.mode & POSIX_S_IFDIR) {
+        attr = 0x10;
+    } else {
+        attr = 0x20;
+        if ((st.mode & POSIX_WRITE_MASK) == 0)
+            attr |= 0x01;
+    }
+    *attr_out = attr;
+    return 1;
+}
+
+int fs_setattr(const char far *fn1, unsigned char dos_attr)
+{
+    static char path[128];
+    static struct fstat st;
+    uint16_t old_mode, new_mode;
+    int rc;
+    if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
+    rc = tnfs_stat(path, &st);
+    if (rc != 0) return rc;
+    old_mode = st.mode;
+    new_mode = old_mode;
+    if (dos_attr & 0x01) {
+        new_mode &= ~POSIX_WRITE_MASK;
+    } else {
+        new_mode |= POSIX_S_IWUSR;
+    }
+    new_mode &= 0x0FFFu;  /* chmod takes permission bits only, strip S_IFMT */
+    if (rbuf.enabled) {
+        rb_write(dos_attr & 0x01 ? "ATTR +R old=" : "ATTR -R old=");
+        rb_hex16(old_mode); rb_write(" new="); rb_hex16(new_mode); rb_write("\r\n");
+    }
+    rc = tnfs_chmod(new_mode, path);
+    if (rbuf.enabled) { rb_write("ATTR CHMOD "); rb_write(rc == 0 ? "OK" : "ERR"); rb_write("\r\n"); }
+    return rc;
 }
 
 void fs_close(const FsHandle *handle)

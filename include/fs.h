@@ -57,6 +57,17 @@ unsigned int fs_read (const FsHandle *handle, unsigned long pos,
                       char far *buf, unsigned int n);
 void         fs_close(const FsHandle *handle);
 
+/* Directory create/delete — return 0 on success, TNFS error code otherwise. */
+int fs_mkdir(const char far *fn1);
+int fs_rmdir(const char far *fn1);
+
+/* File delete — returns 0 on success, negative TNFS error otherwise. */
+int fs_delete(const char far *fn1);
+
+/* Attribute get/set via tnfs_stat/tnfs_chmod. */
+int fs_getattr_stat(const char far *fn1, unsigned char *attr_out);
+int fs_setattr     (const char far *fn1, unsigned char dos_attr);
+
 /* Fill a DOS SFT for a network file described by an FsHandle. */
 void sft_fill_handle(const FsHandle *handle, const FsNode *node, char far *sft);
 

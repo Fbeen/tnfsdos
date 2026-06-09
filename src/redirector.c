@@ -22,6 +22,66 @@
 char far *glob_sdaptr;  /* written by init_cds; read by all handlers */
 
 /* ------------------------------------------------------------------ */
+/*  AL=01h  RMDIR  /  AL=02h  MKDIR  /  AL=03h  SETCURDIR              */
+/* ------------------------------------------------------------------ */
+
+unsigned int __cdecl do_setcurdir(void)
+{
+    static FsNode node;
+    unsigned char c;
+    char far *fn1;
+    int rc;
+
+    if (!glob_sdaptr) return 0xFFFFu;
+    c = (unsigned char)(glob_sdaptr[0x9E]);
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c != (unsigned char)('A' + g_drive_idx)) return 0xFFFFu;
+
+    fn1 = glob_sdaptr + 0x9E;
+
+    if (fs_is_root(fn1)) {
+        if (rbuf.enabled) rb_write("2F 1103 SETCURDIR ROOT\r\n");
+        return 0;
+    }
+    if (fs_resolve(fn1, &node) && fs_is_dir(&node)) {
+        if (rbuf.enabled) { rb_write("2F 1103 SETCURDIR EXIST "); rb_write(fs_get_name(&node)); rb_write("\r\n"); }
+        return 0;
+    }
+    /* Path doesn't exist — try to create it (DOS uses SETCURDIR for mkdir) */
+    rc = fs_mkdir(fn1);
+    if (rc == 0) {
+        if (rbuf.enabled) rb_write("2F 1103 SETCURDIR MKDIR OK\r\n");
+        return 0;
+    }
+    if (rbuf.enabled) rb_write("2F 1103 SETCURDIR MKDIR FAIL\r\n");
+    return 3;
+}
+
+unsigned int __cdecl do_rmdir(void)
+{
+    char far *fn1;
+    int rc;
+    if (!glob_sdaptr) return 3;
+    fn1 = glob_sdaptr + 0x9E;
+    rc = fs_rmdir(fn1);
+    if (rbuf.enabled) { rb_write("2F 1101 RMDIR "); rb_write(rc == 0 ? "OK" : "FAIL"); rb_write("\r\n"); }
+    if (rc == 0) return 0;
+    return (rc == 0x17) ? 16 : 5;  /* ENOTEMPTY→16, else access denied */
+}
+
+unsigned int __cdecl do_mkdir(void)
+{
+    char far *fn1;
+    int rc;
+    if (!glob_sdaptr) return 3;
+    fn1 = glob_sdaptr + 0x9E;
+    rc = fs_mkdir(fn1);
+    if (rbuf.enabled) { rb_write("2F 1102 MKDIR "); rb_write(rc == 0 ? "OK" : "FAIL"); rb_write("\r\n"); }
+    if (rc == 0) return 0;
+    return (rc == 0x02) ? 3 : 5;  /* ENOENT→path not found, else access denied */
+}
+
+/* ------------------------------------------------------------------ */
 /*  AL=05h  CHDIR                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -147,15 +207,39 @@ unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
 }
 
 /* ------------------------------------------------------------------ */
+/*  AL=0Eh  SET FILE ATTRIBUTES  (DOS 6.x; CX = new attr byte)         */
+/* ------------------------------------------------------------------ */
+
+unsigned int __cdecl do_setattr(unsigned int cx_val)
+{
+    char far *fn1;
+    int rc;
+    if (!glob_sdaptr) return 5;
+    fn1 = glob_sdaptr + 0x9E;
+    if (rbuf.enabled) {
+        rb_write("ATTR SET dos="); rb_hex8((unsigned char)cx_val);
+        rb_write(" "); rb_far_str(FP_SEG(fn1), FP_OFF(fn1), 40);
+        rb_write("\r\n");
+    }
+    rc = fs_setattr(fn1, (unsigned char)(cx_val & 0xFF));
+    if (rc == 0) return 0;
+    return (rc == -2) ? 2 : 5;
+}
+
+/* ------------------------------------------------------------------ */
 /*  AL=0Fh  GETATTR                                                     */
 /* ------------------------------------------------------------------ */
 
 unsigned int __cdecl do_getattr(void)
 {
-    static FsNode node;
+    static unsigned char attr;
+    char far *fn1;
     if (!glob_sdaptr) return 0xFFFF;
-    if (!fs_resolve(glob_sdaptr + 0x9E, &node)) return 0xFFFF;
-    return fs_get_attr(&node);
+    fn1 = glob_sdaptr + 0x9E;
+    if (rbuf.enabled) { rb_write("ATTR GET raw="); rb_far_str(FP_SEG(fn1), FP_OFF(fn1), 40); rb_write("\r\n"); }
+    if (!fs_getattr_stat(fn1, &attr)) return 0xFFFF;
+    if (rbuf.enabled) { rb_write("ATTR RET dos="); rb_hex8(attr); rb_write("\r\n"); }
+    return (unsigned int)attr;
 }
 
 /* ------------------------------------------------------------------ */
@@ -268,6 +352,22 @@ void __cdecl do_close(unsigned int es_val, unsigned int di_val)
 }
 
 void __cdecl do_diskspace(void) { }
+
+/* ------------------------------------------------------------------ */
+/*  AL=10h  DELETE                                                      */
+/* ------------------------------------------------------------------ */
+
+unsigned int __cdecl do_delete(void)
+{
+    char far *fn1;
+    int rc;
+    if (!glob_sdaptr) return 2;
+    fn1 = glob_sdaptr + 0x9E;
+    rc = fs_delete(fn1);
+    if (rbuf.enabled) { rb_write("2F 1113 DEL "); rb_write(rc == 0 ? "OK" : "FAIL"); rb_write("\r\n"); }
+    if (rc == 0) return 0;
+    return (rc == -2) ? 2 : 5;  /* -ENOENT→file not found, else access denied */
+}
 
 /* ------------------------------------------------------------------ */
 /*  AL=25h  post-EXEC notification (no output buffer)                  */

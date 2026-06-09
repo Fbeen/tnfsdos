@@ -26,11 +26,16 @@
 ;   driver callback), the nested call returns immediately with error.
 ;
 ; Subfunctions handled (AL value):
+;   01h  RMDIR
+;   02h  MKDIR
+;   03h  SETCURDIR
 ;   05h  CHDIR
 ;   06h  CLOSE
 ;   08h  READ       ES:DI=SFT, CX=bytes → CX=bytes read
 ;   0Ch  DISKSPACE  AX=spc, BX=avail, CX=bps, DX=total
 ;   0Fh  GETATTR    → CX=attr
+;   0Eh  SET FILE ATTR  CX=new attr
+;   13h  DELETE
 ;   16h  OPEN       ES:DI=SFT
 ;   25h  post-EXEC notify → AX=0 for N: paths, chain otherwise
 ;   2Eh  SPOPNFIL   ES:DI=SFT → CX=1
@@ -43,6 +48,9 @@
 
 extrn   _old_int2f          : dword
 extrn   _log_2f_call        : near   ; void __cdecl (ax,bx,cx,dx,ds,si,es,di)
+extrn   _do_setcurdir       : near   ; unsigned __cdecl (void)
+extrn   _do_rmdir           : near   ; unsigned __cdecl (void)
+extrn   _do_mkdir           : near   ; unsigned __cdecl (void)
 extrn   _do_chdir           : near   ; unsigned __cdecl (void)
 extrn   _do_findfirst       : near   ; unsigned __cdecl (void)
 extrn   _do_findnext        : near   ; unsigned __cdecl (unsigned es, unsigned di)
@@ -52,6 +60,8 @@ extrn   _do_spopen          : near   ; unsigned __cdecl (unsigned es, unsigned d
 extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx)
 extrn   _do_close           : near   ; void __cdecl (unsigned es, unsigned di)
 extrn   _do_diskspace       : near   ; void __cdecl (void)
+extrn   _do_setattr         : near   ; unsigned __cdecl (unsigned cx)
+extrn   _do_delete          : near   ; unsigned __cdecl (void)
 extrn   _do_exec_notify     : near   ; unsigned __cdecl (void)
 
 ;============================================================================
@@ -191,6 +201,12 @@ ENDIF
         ; 4. Dispatch on AL
         mov     al, byte ptr [arg_ax]   ; lo byte of saved AX
 
+        cmp     al, 01h
+        je      handle_1101
+        cmp     al, 02h
+        je      handle_1102
+        cmp     al, 03h
+        je      handle_1103
         cmp     al, 05h
         je      handle_1105
         cmp     al, 06h
@@ -199,8 +215,12 @@ ENDIF
         je      handle_1108
         cmp     al, 0Ch
         je      handle_110C
+        cmp     al, 0Eh
+        je      handle_110E
         cmp     al, 0Fh
         je      handle_110F
+        cmp     al, 13h
+        je      handle_1113
         cmp     al, 16h
         je      handle_1116
         cmp     al, 2Eh
@@ -212,6 +232,36 @@ ENDIF
         cmp     al, 1Ch
         je      handle_111C
         jmp     do_2f_log
+
+        ;--- AL=01h: RMDIR ---------------------------------------------------
+handle_1101:
+        call    _do_rmdir
+        test    ax, ax
+        jnz     do_rmdir_fail
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
+do_rmdir_fail:
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
+
+        ;--- AL=02h: MKDIR ---------------------------------------------------
+handle_1102:
+        call    _do_mkdir
+        test    ax, ax
+        jnz     do_mkdir_fail
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
+do_mkdir_fail:
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
+
+        ;--- AL=03h: SETCURDIR -----------------------------------------------
+handle_1103:
+        call    _do_setcurdir
+        cmp     ax, 0FFFFh
+        je      do_tsr_chain
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
 
         ;--- AL=05h: CHDIR ---------------------------------------------------
 handle_1105:
@@ -253,6 +303,19 @@ handle_110C:
         mov     [res_dx], 4096
         jmp     do_tsr_ret_ok
 
+        ;--- AL=0Eh: SET FILE ATTRIBUTES (DOS 6.x; CX=new attr) -------------
+handle_110E:
+        push    word ptr [arg_cx]       ; cx_val (new attributes)
+        call    _do_setattr
+        add     sp, 2
+        test    ax, ax
+        jnz     do_setattr_fail
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
+do_setattr_fail:
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
+
         ;--- AL=0Fh: GETATTR -------------------------------------------------
 handle_110F:
         call    _do_getattr
@@ -263,6 +326,17 @@ handle_110F:
         jmp     do_tsr_ret_ok
 do_110F_nf:
         mov     [res_ax], 2             ; file not found
+        jmp     do_tsr_ret_err
+
+        ;--- AL=13h: DELETE --------------------------------------------------
+handle_1113:
+        call    _do_delete
+        test    ax, ax
+        jnz     do_delete_fail
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
+do_delete_fail:
+        mov     [res_ax], ax
         jmp     do_tsr_ret_err
 
         ;--- AL=16h: OPEN  (ES:DI=SFT) ---------------------------------------
