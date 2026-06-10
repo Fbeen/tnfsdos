@@ -278,8 +278,13 @@ handle_1103:
         call    _do_setcurdir
         cmp     ax, 0FFFFh
         je      do_tsr_chain
+        test    ax, ax
+        jnz     do_setcurdir_fail
         mov     [res_ax], 0
         jmp     do_tsr_ret_ok
+do_setcurdir_fail:
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
 
         ;--- AL=05h: CHDIR ---------------------------------------------------
 handle_1105:
