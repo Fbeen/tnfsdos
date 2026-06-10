@@ -52,6 +52,8 @@ extrn   _do_setcurdir       : near   ; unsigned __cdecl (void)
 extrn   _do_rmdir           : near   ; unsigned __cdecl (void)
 extrn   _do_mkdir           : near   ; unsigned __cdecl (void)
 extrn   _do_chdir           : near   ; unsigned __cdecl (void)
+extrn   _do_qualify         : near   ; unsigned __cdecl (unsigned es, unsigned di)
+extrn   _s_qualify_buf      : byte  ; QUALIFY canonical path buffer (in DGROUP)
 extrn   _do_findfirst       : near   ; unsigned __cdecl (void)
 extrn   _do_findnext        : near   ; unsigned __cdecl (unsigned es, unsigned di)
 extrn   _do_getattr         : near   ; unsigned __cdecl (void)
@@ -60,9 +62,13 @@ extrn   _do_spopen          : near   ; unsigned __cdecl (unsigned es, unsigned d
 extrn   _do_read            : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx)
 extrn   _do_close           : near   ; void __cdecl (unsigned es, unsigned di)
 extrn   _do_diskspace       : near   ; void __cdecl (void)
+extrn   _do_rename          : near   ; unsigned __cdecl (void)
 extrn   _do_setattr         : near   ; unsigned __cdecl (unsigned cx)
 extrn   _do_delete          : near   ; unsigned __cdecl (void)
 extrn   _do_exec_notify     : near   ; unsigned __cdecl (void)
+extrn   _do_write           : near   ; unsigned __cdecl (unsigned es, unsigned di, unsigned cx)
+extrn   _do_create          : near   ; unsigned __cdecl (unsigned es, unsigned di)
+extrn   _do_seekend         : near   ; unsigned long __cdecl (unsigned es, unsigned di, unsigned cx, unsigned bx)
 
 ;============================================================================
 ; DGROUP data — all accessible via DS (=DGROUP) from within the handler
@@ -90,6 +96,10 @@ res_ax      dw  0
 res_bx      dw  0
 res_cx      dw  0
 res_dx      dw  0
+
+; QUALIFY (AL=23h) ES:DI result — set to s_qualify_buf address
+res_qualify_di  dw  0
+res_qualify_es  dw  0
 
 ; Reentrancy guard: 0=idle, 1=inside handler
 ; Exported as _in_handler so C debug code can read it.
@@ -213,6 +223,10 @@ ENDIF
         je      handle_1106
         cmp     al, 08h
         je      handle_1108
+        cmp     al, 09h
+        je      handle_1109
+        cmp     al, 11h
+        je      handle_1111
         cmp     al, 0Ch
         je      handle_110C
         cmp     al, 0Eh
@@ -223,6 +237,10 @@ ENDIF
         je      handle_1113
         cmp     al, 16h
         je      handle_1116
+        cmp     al, 17h
+        je      handle_1117
+        cmp     al, 21h
+        je      handle_1121
         cmp     al, 2Eh
         je      handle_112E
         cmp     al, 25h
@@ -294,6 +312,28 @@ handle_1108:
         mov     [res_ax], 0
         jmp     do_tsr_ret_ok
 
+        ;--- AL=09h: WRITE (ES:DI=SFT, CX=count) ----------------------------
+handle_1109:
+        push    word ptr [arg_cx]       ; cx_val  (3rd arg)
+        push    word ptr [arg_di]       ; di_val  (2nd arg)
+        push    word ptr [arg_es]       ; es_val  (1st arg)
+        call    _do_write
+        add     sp, 6
+        mov     [res_cx], ax            ; CX = bytes actually written
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
+
+        ;--- AL=11h: RENAME --------------------------------------------------
+handle_1111:
+        call    _do_rename
+        test    ax, ax
+        jnz     do_rename_fail
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
+do_rename_fail:
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
+
         ;--- AL=0Ch: DISKSPACE -----------------------------------------------
 handle_110C:
         call    _do_diskspace
@@ -353,6 +393,32 @@ do_open_err:
         mov     [res_ax], ax
         jmp     do_tsr_ret_err
 
+        ;--- AL=17h: CREATE/OPEN (ES:DI=SFT) ---------------------------------
+handle_1117:
+        push    word ptr [arg_di]
+        push    word ptr [arg_es]
+        call    _do_create
+        add     sp, 4
+        test    ax, ax
+        jnz     do_create_err
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_ok
+do_create_err:
+        mov     [res_ax], ax
+        jmp     do_tsr_ret_err
+
+        ;--- AL=21h: SEEKEND (BX:CX=signed offset, ES:DI=SFT) ---------------
+handle_1121:
+        push    word ptr [arg_bx]       ; bx_val (4th arg, high word of offset)
+        push    word ptr [arg_cx]       ; cx_val (3rd arg, low word of offset)
+        push    word ptr [arg_di]       ; di_val (2nd arg)
+        push    word ptr [arg_es]       ; es_val (1st arg)
+        call    _do_seekend
+        add     sp, 8
+        mov     [res_ax], ax            ; DX:AX = new file position
+        mov     [res_dx], dx
+        jmp     do_tsr_ret_ok
+
         ;--- AL=2Eh: SPOPNFIL  (ES:DI=SFT) ----------------------------------
 handle_112E:
         push    word ptr [arg_di]
@@ -395,6 +461,25 @@ handle_111C:
         jnz     do_tsr_ret_err          ; EOF/error: CF=1
         jmp     do_tsr_ret_ok           ; found: CF=0
 
+        ;--- AL=23h: QUALIFY FILENAME ----------------------------------------
+        ; On exit: ES:DI must point to driver's OWN canonical path buffer.
+        ; DOS reads ES:DI after CF=0 to update fn1; returning caller's ES:DI
+        ; unchanged would leave fn1 = CWD (truncated path).
+handle_1123:
+        push    word ptr [arg_di]
+        push    word ptr [arg_es]
+        call    _do_qualify
+        add     sp, 4
+        test    ax, ax
+        jnz     do_1123_chain
+        mov     word ptr [res_qualify_di], offset _s_qualify_buf
+        mov     ax, DGROUP
+        mov     word ptr [res_qualify_es], ax
+        mov     [res_ax], 0
+        jmp     do_tsr_ret_qualify
+do_1123_chain:
+        jmp     do_tsr_chain
+
         ;--- unhandled AH=11h: log then chain --------------------------------
 do_2f_log:
         push    word ptr [arg_di]       ; di_val  (8th arg, rightmost)
@@ -414,6 +499,44 @@ do_2f_log:
         ; All paths arrive here with results in res_ax / res_bx / res_cx / res_dx.
         ; Restore caller SS:SP, write results to the saved frame, then IRET.
         ;====================================================================
+
+        ; CF=0 (success) — write AX/BX/CX/DX + ES:DI from res_qualify_es/di
+        ; Used by AL=23h QUALIFY so DOS gets correct canonical path in ES:DI.
+do_tsr_ret_qualify:
+        mov     byte ptr [_in_handler], 0
+IFNDEF NOSTACK
+        cli
+        mov     ax, [saved_ss]
+        mov     ss, ax
+        mov     sp, [saved_sp]          ; sp = bp = top of saved frame
+        sti
+ENDIF
+        mov     ax, [res_ax]
+        mov     word ptr [bp+16], ax
+        mov     ax, [res_bx]
+        mov     word ptr [bp+14], ax
+        mov     ax, [res_cx]
+        mov     word ptr [bp+12], ax
+        mov     ax, [res_dx]
+        mov     word ptr [bp+10], ax
+        mov     ax, [res_qualify_di]
+        mov     word ptr [bp+6], ax     ; DI = offset of s_qualify_buf
+        mov     ax, [res_qualify_es]
+        mov     word ptr [bp+2], ax     ; ES = DGROUP segment
+        pop     bp
+        pop     es
+        pop     ds
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        push    bp
+        mov     bp, sp
+        and     word ptr [bp+6], 0FFFEh ; CF = 0
+        pop     bp
+        iret
 
         ; CF=0 (success) — write all result registers, clear carry
 do_tsr_ret_ok:

@@ -6,7 +6,7 @@
 #ifdef TNFSDRV_DEBUG_RINGBUF
 
 #define RING_MAGIC  0xBEEFu
-#define RING_SIZE   4096
+#define RING_SIZE   32768
 
 typedef struct {
     unsigned int  magic;

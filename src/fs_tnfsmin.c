@@ -72,6 +72,12 @@ static char     s_active_path[128];           /* TNFS path, e.g. "/" or "/APAC" 
 static uint8_t  s_active_valid;
 static DirEntry s_active_entries[DIR_CACHE_MAX];
 static int      s_active_count;
+static uint16_t s_active_loaded_ticks;        /* BIOS tick count at last load */
+
+/* Cache configuration (set by fs_set_cache_config before TSR install) */
+static uint8_t  g_cache_enabled  = 1;
+static uint16_t g_cache_ttl_secs = 300;
+static uint8_t  g_cache_dirs     = 1;
 
 /* ------------------------------------------------------------------ */
 /*  Path helpers                                                        */
@@ -277,6 +283,33 @@ static int tmpl_matches(const char *tmpl, const char *fcb)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Cache helpers                                                       */
+/* ------------------------------------------------------------------ */
+
+static uint16_t get_bios_ticks(void)
+{
+    return *(uint16_t far *)MK_FP(0x0040, 0x006C);
+}
+
+void cache_invalidate(const char *reason)
+{
+    if (rbuf.enabled) { rb_write("DC_INVALIDATE reason="); rb_write(reason); rb_write("\r\n"); }
+    s_active_valid = 0;
+}
+
+void fs_set_cache_config(uint8_t enabled, uint16_t ttl_secs, uint8_t dirs)
+{
+    g_cache_enabled  = enabled;
+    g_cache_ttl_secs = ttl_secs;
+    g_cache_dirs     = (dirs > 1) ? 1 : dirs;
+    if (rbuf.enabled) {
+        rb_write("DC_CFG enabled="); rb_dec(g_cache_enabled);
+        rb_write(" ttl="); rb_dec(g_cache_ttl_secs);
+        rb_write(" dirs="); rb_dec(g_cache_dirs); rb_write("\r\n");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Single-active-directory cache loader                                */
 /* ------------------------------------------------------------------ */
 
@@ -290,12 +323,33 @@ static int load_dir_cache(const char *path)
 
     if (rbuf.enabled) { rb_write("DC_REQ path=\""); rb_write(path); rb_write("\"\r\n"); }
 
-    s_active_valid = 0; /* cache disabled — remove this line to re-enable */
-
-    /* Cache hit — same directory already loaded, no TNFS needed */
-    if (s_active_valid && strcmp(s_active_path, path) == 0) {
-        if (rbuf.enabled) { rb_write("DC_HIT path=\""); rb_write(path); rb_write("\"\r\n"); }
-        return 1;
+    if (!g_cache_enabled) {
+        /* Cache disabled — always load fresh */
+        if (rbuf.enabled) { rb_write("DC_OFF path=\""); rb_write(path); rb_write("\"\r\n"); }
+    } else if (s_active_valid && strcmp(s_active_path, path) == 0) {
+        /* Same directory — check TTL */
+        uint16_t now   = get_bios_ticks();
+        uint16_t age_t = (uint16_t)(now - s_active_loaded_ticks);
+        uint16_t age_s = age_t / 18u;
+        if (age_s < g_cache_ttl_secs) {
+            if (rbuf.enabled) {
+                rb_write("DC_HIT path=\""); rb_write(path);
+                rb_write("\" age="); rb_dec(age_s); rb_write("\r\n");
+            }
+            return 1;
+        }
+        if (rbuf.enabled) {
+            rb_write("DC_MISS path=\""); rb_write(path);
+            rb_write("\" reason=expired age="); rb_dec(age_s); rb_write("\r\n");
+        }
+    } else if (s_active_valid) {
+        if (rbuf.enabled) {
+            rb_write("DC_MISS path=\""); rb_write(path); rb_write("\" reason=path\r\n");
+        }
+    } else {
+        if (rbuf.enabled) {
+            rb_write("DC_MISS path=\""); rb_write(path); rb_write("\" reason=none\r\n");
+        }
     }
 
     /* Invalidate before loading; will only become valid after CLOSEDIR OK */
@@ -354,6 +408,7 @@ static int load_dir_cache(const char *path)
     if (rbuf.enabled) { rb_write("XDIR close OK\r\n"); }
 
     strcpy(s_active_path, path);
+    s_active_loaded_ticks = get_bios_ticks();
     s_active_valid = 1;
     if (rbuf.enabled) { rb_write("DC_READY path=\""); rb_write(path); rb_write("\" n="); rb_dec((unsigned)s_active_count); rb_write("\r\n"); }
     return 1;
@@ -384,6 +439,35 @@ int fs_resolve(const char far *path, FsNode *node)
     }
 
     if (rbuf.enabled) rb_write("RES miss\r\n");
+
+    /* Fallback: TNFS STAT the file directly.
+     * Needed for newly-created files not yet returned by READDIRX, and for
+     * files without extensions that Linux *-dot-* glob silently omits. */
+    {
+        static char stat_path[128];
+        static struct fstat st;
+        int fp = 0, k;
+        if (dir_path[0] == '/' && dir_path[1] == '\0') {
+            stat_path[fp++] = '/';
+        } else {
+            for (k = 0; dir_path[k] && fp < 120; k++) stat_path[fp++] = dir_path[k];
+            stat_path[fp++] = '/';
+        }
+        for (k = 0; entry[k] && fp < 126; k++) stat_path[fp++] = entry[k];
+        stat_path[fp] = '\0';
+        if (rbuf.enabled) { rb_write("RES STAT "); rb_write(stat_path); rb_write("\r\n"); }
+        if (tnfs_stat(stat_path, &st) == 0 && s_active_count < DIR_CACHE_MAX) {
+            if (rbuf.enabled) rb_write("RES STAT OK\r\n");
+            for (k = 0; entry[k] && k < 12; k++) s_active_entries[s_active_count].name[k] = entry[k];
+            s_active_entries[s_active_count].name[k] = '\0';
+            s_active_entries[s_active_count].attr = (st.mode & 0x4000u) ? 0x10 : 0x20;
+            s_active_entries[s_active_count].size = (unsigned long)st.size;
+            node->dir_ctx = 0;
+            node->idx     = s_active_count;
+            s_active_count++;
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -429,12 +513,14 @@ void fs_fill_found(const FsNode *node, char far *found)
     found[31] = (char)(sz >> 24);
 }
 
-static char s_read_buf[512]; /* intermediate buffer: tnfs_read (near) → far DTA copy */
+static char s_read_buf[512];  /* tnfs_read (near) → far DTA */
+static char s_write_buf[512]; /* far DTA → tnfs_write (near) */
 
-void fs_open(const FsNode *node, FsHandle *handle)
+void fs_open(const FsNode *node, FsHandle *handle, unsigned char dos_mode)
 {
     static char tnfs_path[128];
     const char *name;
+    uint16_t tnfs_flags;
     int i, rc;
 
     handle->dir_ctx = node->dir_ctx;
@@ -455,9 +541,14 @@ void fs_open(const FsNode *node, FsHandle *handle)
     while (*name && i < 126) tnfs_path[i++] = *name++;
     tnfs_path[i] = '\0';
 
-    if (rbuf.enabled) { rb_write("FS_OPEN "); rb_write(tnfs_path); rb_write("\r\n"); }
+    if (dos_mode == 1)      tnfs_flags = TNFS_O_WRONLY;
+    else if (dos_mode == 2) tnfs_flags = TNFS_O_RDWR;
+    else                    tnfs_flags = TNFS_O_RDONLY;
 
-    rc = tnfs_open(tnfs_path, 0x0001, 0); /* O_RDONLY */
+    if (rbuf.enabled) { rb_write("FS_OPEN "); rb_write(tnfs_path);
+                        rb_write(" mode="); rb_hex8(dos_mode); rb_write("\r\n"); }
+
+    rc = tnfs_open(tnfs_path, tnfs_flags, 0);
     if (rc < 0) {
         if (rbuf.enabled) { rb_write("FS_OPEN FAIL\r\n"); }
         return;
@@ -475,13 +566,35 @@ unsigned int fs_read(const FsHandle *handle, unsigned long pos,
     tnfs_lseek(handle->tnfs_fd, 0, (uint32_t)pos);
 
     while (total < n) {
+        int rc;
         chunk = n - total;
         if (chunk > sizeof(s_read_buf)) chunk = (unsigned int)sizeof(s_read_buf);
-        got = (unsigned int)tnfs_read(s_read_buf, handle->tnfs_fd, (uint16_t)chunk);
-        if (got == 0) break;
+        rc = tnfs_read(s_read_buf, handle->tnfs_fd, (uint16_t)chunk);
+        if (rc <= 0) break;  /* 0 = EOF, negative = error; never cast negative to unsigned */
+        got = (unsigned int)rc;
         for (i = 0; i < got; i++) buf[total + i] = s_read_buf[i];
         total += got;
         if (got < chunk) break;
+    }
+    return total;
+}
+
+unsigned int fs_write(const FsHandle *handle, unsigned long pos,
+                      const char far *buf, unsigned int n)
+{
+    unsigned int total = 0, chunk, i;
+    int rc;
+
+    if (handle->tnfs_fd == 0xFF) return 0;
+    tnfs_lseek(handle->tnfs_fd, 0, (uint32_t)pos);
+
+    while (total < n) {
+        chunk = n - total;
+        if (chunk > sizeof(s_write_buf)) chunk = (unsigned int)sizeof(s_write_buf);
+        for (i = 0; i < chunk; i++) s_write_buf[i] = buf[total + i];
+        rc = tnfs_write(s_write_buf, handle->tnfs_fd, (uint16_t)chunk);
+        if (rc != 0) break;
+        total += chunk;
     }
     return total;
 }
@@ -508,10 +621,12 @@ static int fn1_to_tnfs_path(const char far *fn1, char *out, int maxlen)
 int fs_mkdir(const char far *fn1)
 {
     static char path[128];
+    static struct fstat st;
     int rc;
     if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
+    if (tnfs_stat(path, &st) == 0) return TNFS_EEXIST;
     rc = tnfs_mkdir(path);
-    s_active_valid = 0;
+    cache_invalidate("mkdir");
     return rc;
 }
 
@@ -520,8 +635,12 @@ int fs_rmdir(const char far *fn1)
     static char path[128];
     int rc;
     if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
+    if (load_dir_cache(path) && s_active_count > 0) {
+        if (rbuf.enabled) rb_write("FS_RMDIR NOTEMPTY\r\n");
+        return TNFS_ENOTEMPTY;
+    }
     rc = tnfs_rmdir(path);
-    s_active_valid = 0;
+    cache_invalidate("rmdir");
     return rc;
 }
 
@@ -529,8 +648,22 @@ int fs_delete(const char far *fn1)
 {
     static char path[128];
     if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
-    s_active_valid = 0;
+    cache_invalidate("del");
     return tnfs_unlink(path);
+}
+
+int fs_rename(const char far *fn1, const char far *fn2)
+{
+    static char old_path[128];
+    static char new_path[128];
+    int rc;
+    if (!fn1_to_tnfs_path(fn1, old_path, sizeof(old_path))) return -1;
+    if (!fn1_to_tnfs_path(fn2, new_path, sizeof(new_path))) return -1;
+    cache_invalidate("ren");
+    if (rbuf.enabled) { rb_write("FS_REN "); rb_write(old_path); rb_write(" -> "); rb_write(new_path); rb_write("\r\n"); }
+    rc = tnfs_rename(old_path, new_path);
+    if (rbuf.enabled) { rb_write("FS_REN "); rb_write(rc == 0 ? "OK" : "FAIL"); rb_write("\r\n"); }
+    return rc;
 }
 
 /* POSIX permission bit masks used by fs_getattr_stat / fs_setattr.
@@ -545,7 +678,21 @@ int fs_getattr_stat(const char far *fn1, unsigned char *attr_out)
 {
     static char path[128];
     static struct fstat st;
+    static FsNode node;
     unsigned char attr;
+
+    /* Prefer the directory cache — gives the stored attribute (possibly updated
+     * by a previous setfileattr call) and avoids an extra TNFS network round-trip. */
+    if (fs_resolve(fn1, &node)) {
+        *attr_out = fs_get_attr(&node);
+        if (rbuf.enabled) {
+            rb_write("ATTR RET idx="); rb_hex8((unsigned char)node.idx);
+            rb_write(" dos="); rb_hex8(*attr_out); rb_write("\r\n");
+        }
+        return 1;
+    }
+
+    /* Cache miss: fall back to tnfs_stat (e.g. for newly-created files) */
     if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return 0;
     if (rbuf.enabled) { rb_write("ATTR GET tnfs="); rb_write(path); rb_write("\r\n"); }
     if (tnfs_stat(path, &st) != 0) return 0;
@@ -558,33 +705,28 @@ int fs_getattr_stat(const char far *fn1, unsigned char *attr_out)
             attr |= 0x01;
     }
     *attr_out = attr;
+    if (rbuf.enabled) { rb_write("ATTR RET dos="); rb_hex8(attr); rb_write("\r\n"); }
     return 1;
 }
 
 int fs_setattr(const char far *fn1, unsigned char dos_attr)
 {
-    static char path[128];
-    static struct fstat st;
-    uint16_t old_mode, new_mode;
-    int rc;
-    if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return -1;
-    rc = tnfs_stat(path, &st);
-    if (rc != 0) return rc;
-    old_mode = st.mode;
-    new_mode = old_mode;
-    if (dos_attr & 0x01) {
-        new_mode &= ~POSIX_WRITE_MASK;
-    } else {
-        new_mode |= POSIX_S_IWUSR;
-    }
-    new_mode &= 0x0FFFu;  /* chmod takes permission bits only, strip S_IFMT */
+    static FsNode node;
+
+    /* Store the new attribute in the directory cache.  The server-side chmod
+     * command (0x27) is not used here: the server on which this was tested does
+     * not implement it (every request times out after 5 retries × ~3 s = ~15 s),
+     * which would stall the test and risk corrupting the packet-driver/TNFS session
+     * state.  Attribute changes are therefore memory-only and survive only for the
+     * duration of the DOS session. */
+    if (!fs_resolve(fn1, &node)) return -2;
+    if (node.idx >= 0 && node.idx < s_active_count)
+        s_active_entries[node.idx].attr = dos_attr;
     if (rbuf.enabled) {
-        rb_write(dos_attr & 0x01 ? "ATTR +R old=" : "ATTR -R old=");
-        rb_hex16(old_mode); rb_write(" new="); rb_hex16(new_mode); rb_write("\r\n");
+        rb_write(dos_attr & 0x01 ? "ATTR SET +R" : "ATTR SET -R");
+        rb_write(" idx="); rb_hex8((unsigned char)node.idx); rb_write("\r\n");
     }
-    rc = tnfs_chmod(new_mode, path);
-    if (rbuf.enabled) { rb_write("ATTR CHMOD "); rb_write(rc == 0 ? "OK" : "ERR"); rb_write("\r\n"); }
-    return rc;
+    return 0;
 }
 
 void fs_close(const FsHandle *handle)
@@ -603,7 +745,7 @@ void sft_fill_handle(const FsHandle *handle, const FsNode *node, char far *sft)
     entry_to_fcb(s_active_entries[node->idx].name, fcb);
     sft[0x04] = s_active_entries[node->idx].attr;
     sft[0x05] = (char)g_drive_idx;
-    sft[0x06] = 0x80;
+    sft[0x06] = 0x80;  /* char device flag — keeps DOS I/O path via DTA (SDA+0x0C) */
     sft[0x07] = (char)handle->tnfs_fd;  /* TNFS file handle for read/close */
     for (k = 0x08; k <= 0x10; k++) sft[k] = 0;
     sz = s_active_entries[node->idx].size;
@@ -614,6 +756,50 @@ void sft_fill_handle(const FsHandle *handle, const FsNode *node, char far *sft)
     for (k = 0x15; k <= 0x1F; k++) sft[k] = 0;
     for (k = 0;    k < 11;   k++) sft[0x20+k] = fcb[k];
     for (k = 0x2B; k <= 0x35; k++) sft[k] = 0;
+}
+
+int fs_create_and_open(const char far *fn1, char far *sft)
+{
+    static char path[128];
+    static char name[13];
+    static char fcb[11];
+    int i, k, last_sep, len, rc;
+
+    if (!fn1_to_tnfs_path(fn1, path, sizeof(path))) return 5;
+    cache_invalidate("create");
+
+    if (rbuf.enabled) { rb_write("FS_CREATE "); rb_write(path); rb_write("\r\n"); }
+
+    rc = tnfs_open(path, TNFS_O_RDWR | TNFS_O_CREAT | TNFS_O_TRUNC, 0x01B6);
+    if (rc < 0) {
+        if (rbuf.enabled) { rb_write("FS_CREATE FAIL\r\n"); }
+        return (rc == -2) ? 3 : 5;  /* -ENOENT=path not found(3), else access denied(5) */
+    }
+
+    /* Extract filename component from fn1 for FCB name in SFT */
+    len = 0;
+    while (fn1[len]) len++;
+    last_sep = -1;
+    for (i = len - 1; i >= 0; i--) {
+        if (fn1[i] == '\\' || fn1[i] == ':') { last_sep = i; break; }
+    }
+    i = (last_sep >= 0) ? last_sep + 1 : 0;
+    k = 0;
+    while (fn1[i] && k < 12) name[k++] = (char)fn1[i++];
+    name[k] = '\0';
+    entry_to_fcb(name, fcb);
+
+    sft[0x04] = 0x20;               /* archive attribute */
+    sft[0x05] = (char)g_drive_idx;
+    sft[0x06] = 0x80;  /* char device flag — keeps DOS I/O path via DTA (SDA+0x0C) */
+    sft[0x07] = (char)(uint8_t)rc;  /* TNFS file handle */
+    for (k = 0x08; k <= 0x14; k++) sft[k] = 0;  /* zero: dir entry cluster, size */
+    for (k = 0x15; k <= 0x1F; k++) sft[k] = 0;  /* file position = 0 */
+    for (k = 0;    k < 11;    k++) sft[0x20+k] = fcb[k];
+    for (k = 0x2B; k <= 0x35; k++) sft[k] = 0;
+
+    if (rbuf.enabled) { rb_write("FS_CREATE OK fd="); rb_hex8((uint8_t)rc); rb_write("\r\n"); }
+    return 0;
 }
 
 int fs_enum_begin(const char far *path, const char far *tmpl, FsDirEnum *de)

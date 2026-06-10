@@ -96,6 +96,7 @@ static void init_cds(const TnfsDrvConfig *cfg)
 
         if (r.w.ax != 0x0001) {
             entry = cds_base + (unsigned)(drive_idx * CDS_ENTRY_SIZE);
+            g_cds_entry_ptr = entry;
 
             entry[0] = cfg->driveletter;
             entry[1] = ':'; entry[2] = '\\'; entry[3] = '\0';
@@ -170,6 +171,7 @@ int main(int argc, char *argv[])
     }
 
     fs_set_drive(cfg.driveletter);
+    fs_set_cache_config(cfg.cache_enabled, cfg.cache_timeout_seconds, cfg.cache_dirs);
     printf("TNFSDRV loaded OK\r\n");
 
     init_cds(&cfg);

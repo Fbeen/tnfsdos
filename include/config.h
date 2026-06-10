@@ -1,6 +1,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+#include <stdint.h>
+
 /* Compile-time fallback drive letter — used to initialise g_drive_idx.
  * The runtime value is set by fs_set_drive() after config_load(). */
 #define TNFSDRV_DRIVE_LETTER  'N'
@@ -22,6 +24,10 @@ typedef struct {
     char         netmask[16];   /* netmask — parsed but currently unused */
     char         gateway[16];   /* gateway — parsed but currently unused */
     unsigned int packetint;     /* packet driver interrupt, default 0x60 */
+    /* Directory cache settings */
+    uint8_t      cache_enabled;          /* 0=off, 1=on */
+    uint16_t     cache_timeout_seconds;  /* TTL in seconds, default 300 */
+    uint8_t      cache_dirs;             /* number of cached dirs (currently max 1) */
 } TnfsDrvConfig;
 
 /* Fill *cfg with built-in defaults (no file I/O). */

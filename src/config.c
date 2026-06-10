@@ -81,6 +81,14 @@ static void apply_key(TnfsDrvConfig *cfg, const char *key, const char *value)
         /* Accept decimal or 0x hex: strtol handles both. */
         unsigned long v = strtoul(value, (char **)0, 0);
         if (v > 0 && v <= 0xFF) cfg->packetint = (unsigned int)v;
+    } else if (str_eq_ci(key, "cache")) {
+        cfg->cache_enabled = str_eq_ci(value, "on") ? 1 : 0;
+    } else if (str_eq_ci(key, "cache_timeout_seconds")) {
+        int v = atoi(value);
+        if (v > 0) cfg->cache_timeout_seconds = (uint16_t)v;
+    } else if (str_eq_ci(key, "cache_dirs")) {
+        int v = atoi(value);
+        if (v >= 0) cfg->cache_dirs = (uint8_t)(v > 255 ? 255 : v);
     }
 }
 
@@ -150,7 +158,10 @@ void config_set_defaults(TnfsDrvConfig *cfg)
     cfg->localip[0]  = '\0';
     cfg->netmask[0]  = '\0';
     cfg->gateway[0]  = '\0';
-    cfg->packetint   = 0x60;
+    cfg->packetint             = 0x60;
+    cfg->cache_enabled         = 1;
+    cfg->cache_timeout_seconds = 300;
+    cfg->cache_dirs            = 1;
 }
 
 int config_load(const char *filename, const char *profile, TnfsDrvConfig *cfg)

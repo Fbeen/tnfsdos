@@ -24,10 +24,11 @@ static const char *al_name(unsigned char al)
     case 0x0D: return "AL=0D";
     case 0x0E: return "SETATTR";
     case 0x0F: return "GETATTR";
-    case 0x10: return "DELETE";
+    case 0x10: return "DEL(10)";
     case 0x11: return "RENAME";
     case 0x12: return "FILEDATE";
-    case 0x17: return "LSEEK";
+    case 0x13: return "DELETE";
+    case 0x17: return "CREATE";
     case 0x19: return "QUALIFY";
     case 0x1B: return "FINDFIRST";
     case 0x1C: return "FINDNEXT";
@@ -46,7 +47,7 @@ void rb_putc(char c)
 {
     unsigned int next = (rbuf.head + 1) % RING_SIZE;
     if (next == rbuf.tail)
-        rbuf.tail = (rbuf.tail + 1) % RING_SIZE;
+        return;  /* buffer full — keep earliest data, discard new */
     rbuf.data[rbuf.head] = c;
     rbuf.head = next;
 }

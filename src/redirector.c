@@ -19,7 +19,8 @@
 #include "fs.h"
 #include "redirector.h"
 
-char far *glob_sdaptr;  /* written by init_cds; read by all handlers */
+char far *glob_sdaptr;      /* written by init_cds; read by all handlers */
+char far *g_cds_entry_ptr;  /* written by init_cds; updated by do_chdir */
 
 /* ------------------------------------------------------------------ */
 /*  AL=01h  RMDIR  /  AL=02h  MKDIR  /  AL=03h  SETCURDIR              */
@@ -44,8 +45,9 @@ unsigned int __cdecl do_setcurdir(void)
         return 0;
     }
     if (fs_resolve(fn1, &node) && fs_is_dir(&node)) {
+        /* Directory already exists — mkdir must fail (INT 21h AH=39h semantics) */
         if (rbuf.enabled) { rb_write("2F 1103 SETCURDIR EXIST "); rb_write(fs_get_name(&node)); rb_write("\r\n"); }
-        return 0;
+        return 5;
     }
     /* Path doesn't exist — try to create it (DOS uses SETCURDIR for mkdir) */
     rc = fs_mkdir(fn1);
@@ -89,14 +91,26 @@ unsigned int __cdecl do_chdir(void)
 {
     static FsNode node;
     char far *fn1;
+    int k;
     if (!glob_sdaptr) return 3;
     fn1 = glob_sdaptr + 0x9E;
 
     if (fs_is_root(fn1)) {
+        if (g_cds_entry_ptr) {
+            g_cds_entry_ptr[0] = fn1[0];
+            g_cds_entry_ptr[1] = ':';
+            g_cds_entry_ptr[2] = '\\';
+            g_cds_entry_ptr[3] = '\0';
+        }
         if (rbuf.enabled) rb_write("2F 1105 CHDIR OK ROOT\r\n");
         return 0;
     }
     if (fs_resolve(fn1, &node) && fs_is_dir(&node)) {
+        if (g_cds_entry_ptr) {
+            for (k = 0; k < 66 && fn1[k]; k++)
+                g_cds_entry_ptr[k] = fn1[k];
+            g_cds_entry_ptr[k] = '\0';
+        }
         if (rbuf.enabled) { rb_write("2F 1105 CHDIR OK "); rb_write(fs_get_name(&node)); rb_write("\r\n"); }
         return 0;
     }
@@ -207,6 +221,39 @@ unsigned int __cdecl do_findnext(unsigned int es_val, unsigned int di_val)
 }
 
 /* ------------------------------------------------------------------ */
+/*  AL=23h  QUALIFY FILENAME                                            */
+/*  Copy the canonical path (fn1) from SDA to ES:DI buffer.            */
+/*  Returning CF=0 lets DOS propagate CX from AL=0Fh back to the app.  */
+/* ------------------------------------------------------------------ */
+
+char s_qualify_buf[128];  /* public: handler.asm returns ES:DI -> here */
+
+unsigned int __cdecl do_qualify(unsigned int es_val, unsigned int di_val)
+{
+    char far *fn1 = glob_sdaptr + 0x9E;
+    unsigned char c;
+    int i;
+    if (!glob_sdaptr) return 0xFFFF;
+    c = (unsigned char)fn1[0];
+    if (c >= 'a' && c <= 'z') c -= 32;
+    if (c != (unsigned char)('A' + g_drive_idx)) return 0xFFFF;
+    /* Copy fn1 to our own buffer; caller's ES:DI on entry may be CWD only */
+    for (i = 0; i < 127; i++) {
+        s_qualify_buf[i] = fn1[i];
+        if (fn1[i] == '\0') break;
+    }
+    s_qualify_buf[127] = '\0';
+    if (rbuf.enabled) {
+        rb_write("1123 edi=");
+        rb_far_str(es_val, di_val, 40);
+        rb_write(" fn1=");
+        rb_far_str(FP_SEG(fn1), FP_OFF(fn1), 40);
+        rb_write("\r\n");
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /*  AL=0Eh  SET FILE ATTRIBUTES  (DOS 6.x; CX = new attr byte)         */
 /* ------------------------------------------------------------------ */
 
@@ -250,6 +297,8 @@ unsigned int __cdecl do_open(unsigned int es_val, unsigned int di_val)
 {
     static FsNode node;
     static FsHandle handle;
+    char far *sft = (char far *)MK_FP(es_val, di_val);
+    unsigned char dos_mode;
     if (!glob_sdaptr || !fs_resolve(glob_sdaptr + 0x9E, &node)) {
         if (rbuf.enabled) rb_write("2F 1116 OPEN NOTFOUND\r\n");
         return 2;
@@ -258,32 +307,51 @@ unsigned int __cdecl do_open(unsigned int es_val, unsigned int di_val)
         if (rbuf.enabled) rb_write("2F 1116 OPEN DENIED\r\n");
         return 5;
     }
-    if (rbuf.enabled) rb_write("2F 1116 OPEN OK\r\n");
-    fs_open(&node, &handle);
-    sft_fill_handle(&handle, &node, (char far *)MK_FP(es_val, di_val));
+    dos_mode = (unsigned char)sft[0x02] & 0x07;
+    if (dos_mode != 0 && (fs_get_attr(&node) & 0x01)) {
+        if (rbuf.enabled) rb_write("2F 1116 OPEN RDONLY\r\n");
+        return 5;  /* access denied — file is read-only */
+    }
+    if (rbuf.enabled) { rb_write("2F 1116 OPEN OK mode="); rb_hex8(dos_mode); rb_write("\r\n"); }
+    fs_open(&node, &handle, dos_mode);
+    sft_fill_handle(&handle, &node, sft);
     return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/*  AL=2Eh  SPOPNFIL (Special Open — used by TYPE/COPY in DOS 5+/6.x)  */
+/*  AL=2Eh  SPOPNFIL (Special Open — open existing OR create if new)   */
 /* ------------------------------------------------------------------ */
 
 unsigned int __cdecl do_spopen(unsigned int es_val, unsigned int di_val)
 {
     static FsNode node;
     static FsHandle handle;
-    if (!glob_sdaptr || !fs_resolve(glob_sdaptr + 0x9E, &node)) {
-        if (rbuf.enabled) rb_write("2F 112E SPOP NOTFOUND\r\n");
-        return 2;
+    char far *sft = (char far *)MK_FP(es_val, di_val);
+    char far *fn1;
+    unsigned char dos_mode;
+    int rc;
+
+    if (!glob_sdaptr) return 5;
+    fn1 = glob_sdaptr + 0x9E;
+
+    if (fs_resolve(fn1, &node)) {
+        if (fs_is_dir(&node)) {
+            if (rbuf.enabled) rb_write("2F 112E SPOP DENIED\r\n");
+            return 5;
+        }
+        dos_mode = (unsigned char)sft[0x02] & 0x07;
+        if (rbuf.enabled) { rb_write("2F 112E SPOP EXIST mode="); rb_hex8(dos_mode); rb_write("\r\n"); }
+        fs_open(&node, &handle, dos_mode);
+        sft_fill_handle(&handle, &node, sft);
+        return 0;
     }
-    if (fs_is_dir(&node)) {
-        if (rbuf.enabled) rb_write("2F 112E SPOP DENIED\r\n");
-        return 5;
-    }
-    if (rbuf.enabled) rb_write("2F 112E SPOP OK\r\n");
-    fs_open(&node, &handle);
-    sft_fill_handle(&handle, &node, (char far *)MK_FP(es_val, di_val));
-    return 0;
+
+    /* File doesn't exist — create it (SPOPNFIL semantics: open OR create) */
+    if (rbuf.enabled) rb_write("2F 112E SPOP CREATE\r\n");
+    rc = fs_create_and_open(fn1, sft);
+    if (rc == 0) return 0;
+    if (rbuf.enabled) rb_write("2F 112E SPOP FAIL\r\n");
+    return (unsigned int)rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -331,7 +399,7 @@ unsigned int __cdecl do_read(unsigned int es_val, unsigned int di_val,
     if (rbuf.enabled) {
         rb_write("2F 1108 READ req="); rb_hex16(cx_val);
         rb_write(" got="); rb_hex16(nbytes);
-        rb_write(" DTA="); rb_hex16(dta_seg); rb_putc(':'); rb_hex16(dta_off);
+        rb_write(" buf="); rb_hex16(dta_seg); rb_putc(':'); rb_hex16(dta_off);
         rb_write("\r\n");
     }
     return nbytes;
@@ -352,6 +420,30 @@ void __cdecl do_close(unsigned int es_val, unsigned int di_val)
 }
 
 void __cdecl do_diskspace(void) { }
+
+/* ------------------------------------------------------------------ */
+/*  AL=11h  RENAME  (fn1=SDA+0x9E old name, fn2=SDA+0x11D new name)   */
+/* ------------------------------------------------------------------ */
+
+unsigned int __cdecl do_rename(void)
+{
+    char far *fn1;
+    char far *fn2;
+    int rc;
+    if (!glob_sdaptr) return 5;
+    fn1 = glob_sdaptr + 0x9E;
+    fn2 = glob_sdaptr + 0x11E;  /* fn1 buf = 128 bytes (0x9E+0x80), fn2 follows */
+    if (rbuf.enabled) {
+        rb_write("2F 1111 REN ");
+        rb_far_str(FP_SEG(fn1), FP_OFF(fn1), 40);
+        rb_write(" -> ");
+        rb_far_str(FP_SEG(fn2), FP_OFF(fn2), 40);
+        rb_write("\r\n");
+    }
+    rc = fs_rename(fn1, fn2);
+    if (rc == 0) return 0;
+    return (rc == -2) ? 2 : 5;
+}
 
 /* ------------------------------------------------------------------ */
 /*  AL=10h  DELETE                                                      */
@@ -382,4 +474,126 @@ unsigned int __cdecl do_exec_notify(void)
     if (c != (unsigned char)('A' + g_drive_idx)) return 0xFFFFu;
     if (rbuf.enabled) rb_write("2F 1125 OK\r\n");
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  AL=09h  WRITE                                                       */
+/* ------------------------------------------------------------------ */
+
+unsigned int __cdecl do_write(unsigned int es_val, unsigned int di_val,
+                               unsigned int cx_val)
+{
+    char far *sft = (char far *)MK_FP(es_val, di_val);
+    char far *sda = glob_sdaptr;
+    char far *buf;
+    unsigned int dta_off, dta_seg;
+    unsigned long pos, new_pos, fsize;
+    unsigned int nbytes;
+    static FsHandle handle;
+
+    handle.dir_ctx = 0;
+    handle.idx     = 0;
+    handle.tnfs_fd = (uint8_t)sft[0x07];
+
+    dta_off = (unsigned int)(unsigned char)sda[0x0C]
+            | ((unsigned int)(unsigned char)sda[0x0D] << 8);
+    dta_seg = (unsigned int)(unsigned char)sda[0x0E]
+            | ((unsigned int)(unsigned char)sda[0x0F] << 8);
+    buf = (char far *)MK_FP(dta_seg, dta_off);
+
+    pos = (unsigned long)(unsigned char)sft[0x15]
+        | ((unsigned long)(unsigned char)sft[0x16] << 8)
+        | ((unsigned long)(unsigned char)sft[0x17] << 16)
+        | ((unsigned long)(unsigned char)sft[0x18] << 24);
+
+    nbytes = fs_write(&handle, pos, buf, cx_val);
+
+    new_pos = pos + nbytes;
+    sft[0x15] = (char)new_pos;
+    sft[0x16] = (char)(new_pos >> 8);
+    sft[0x17] = (char)(new_pos >> 16);
+    sft[0x18] = (char)(new_pos >> 24);
+
+    fsize = (unsigned long)(unsigned char)sft[0x11]
+          | ((unsigned long)(unsigned char)sft[0x12] << 8)
+          | ((unsigned long)(unsigned char)sft[0x13] << 16)
+          | ((unsigned long)(unsigned char)sft[0x14] << 24);
+    if (new_pos > fsize) {
+        sft[0x11] = (char)new_pos;
+        sft[0x12] = (char)(new_pos >> 8);
+        sft[0x13] = (char)(new_pos >> 16);
+        sft[0x14] = (char)(new_pos >> 24);
+    }
+
+    if (rbuf.enabled) {
+        rb_write("2F 1109 WRITE req="); rb_hex16(cx_val);
+        rb_write(" got="); rb_hex16(nbytes);
+        rb_write("\r\n");
+    }
+    return nbytes;
+}
+
+/* ------------------------------------------------------------------ */
+/*  AL=17h  CREATE/OPEN (AH=3Ch create/truncate, AH=5Bh create-new)   */
+/* ------------------------------------------------------------------ */
+
+unsigned int __cdecl do_create(unsigned int es_val, unsigned int di_val)
+{
+    char far *fn1;
+    int rc;
+    if (!glob_sdaptr) return 5;
+    fn1 = glob_sdaptr + 0x9E;
+    if (rbuf.enabled) { rb_write("2F 1117 CREATE "); rb_far_str(FP_SEG(fn1), FP_OFF(fn1), 40); rb_write("\r\n"); }
+    rc = fs_create_and_open(fn1, (char far *)MK_FP(es_val, di_val));
+    if (rc == 0) return 0;
+    if (rbuf.enabled) rb_write("2F 1117 FAIL\r\n");
+    return (unsigned int)rc;
+}
+
+/* ------------------------------------------------------------------ */
+/*  AL=21h  SEEKEND  (BX:CX = signed offset from end)                  */
+/* ------------------------------------------------------------------ */
+
+unsigned long __cdecl do_seekend(unsigned int es_val, unsigned int di_val,
+                                  unsigned int cx_val, unsigned int bx_val)
+{
+    char far *sft;
+    unsigned long fsize, offset, new_pos;
+    unsigned char fd_byte, mode_byte;
+
+    if (rbuf.enabled) {
+        rb_write("2F 1121 SEEKEND SFT=");
+        rb_hex16(es_val); rb_putc(':'); rb_hex16(di_val);
+        rb_write(" BX="); rb_hex16(bx_val);
+        rb_write(" CX="); rb_hex16(cx_val);
+        rb_write("\r\n");
+    }
+
+    sft = (char far *)MK_FP(es_val, di_val);
+    mode_byte = (unsigned char)sft[0x02];
+    fd_byte   = (unsigned char)sft[0x07];
+
+    fsize = (unsigned long)(unsigned char)sft[0x11]
+          | ((unsigned long)(unsigned char)sft[0x12] << 8)
+          | ((unsigned long)(unsigned char)sft[0x13] << 16)
+          | ((unsigned long)(unsigned char)sft[0x14] << 24);
+
+    offset  = (unsigned long)cx_val | ((unsigned long)bx_val << 16);
+    new_pos = fsize + offset;
+
+    sft[0x15] = (char)new_pos;
+    sft[0x16] = (char)(new_pos >> 8);
+    sft[0x17] = (char)(new_pos >> 16);
+    sft[0x18] = (char)(new_pos >> 24);
+
+    if (rbuf.enabled) {
+        rb_write("2F 1121 SEEKEND mode="); rb_hex8(mode_byte);
+        rb_write(" fd="); rb_hex8(fd_byte);
+        rb_write(" sz=");
+        rb_hex16((unsigned int)(fsize >> 16)); rb_hex16((unsigned int)fsize);
+        rb_write(" new=");
+        rb_hex16((unsigned int)(new_pos >> 16)); rb_hex16((unsigned int)new_pos);
+        rb_write("\r\n");
+    }
+    return new_pos;
 }
